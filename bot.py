@@ -1,6 +1,4 @@
-hola
-  mundo
-fin#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Bridge Táctico → Telegram  ·  v3.1 (misma lógica que el indicador Bridge Táctico v7.3)
 Vigila tus favoritos en 1m / 3m / 5m / 15m y avisa por Telegram:
