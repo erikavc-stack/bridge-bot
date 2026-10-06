@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v3.3 (misma lógica que el indicador Bridge Táctico v7.3)
+Bridge Táctico → Telegram  ·  v3.5 (misma lógica que el indicador Bridge Táctico v7.3)
 Vigila tus favoritos en 1m / 3m / 5m / 15m y avisa por Telegram:
   nueva señal LONG/SHORT x/3 con entrada, DCA, SL, TP y CANTIDAD/MARGEN de cada entrada,
   TP1 alcanzado y cierre con el resultado en $.
@@ -20,8 +20,8 @@ Variables de entorno (opcionales): TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (si no hay c
   SYMBOLS ("BTCUSDT,ETHUSDT"), TIMEFRAMES ("1m,3m,5m,15m"), CAPITAL (2000), RISK_PCT (2),
   MIN_DIST (0.6), FEE_TAKER (0.06), FEE_MAKER (0.02), USE_H4 ("1" = filtro 4h en 1m-5m), TEST ("1")
 """
-import json, os, re, sys, time, math
-import urllib.request, urllib.parse
+import json, os, re, sys, time, math, threading
+import urllib.request, urllib.parse, urllib.error
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -59,20 +59,85 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE, "state.json")
 CONFIG_FILE = os.path.join(BASE, "config.json")
 SOURCES = ["https://fapi.binance.com/fapi/v1/klines", "https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]
+BITUNIX = "https://fapi.bitunix.com/api/v1/futures/market/kline"  # respaldo: monedas que no están en Binance (OKB, RAY...)
+_bitunix_syms = set()
 PLACEHOLDERS = ("", "PEGA_AQUI_TU_TOKEN", "PEGA_AQUI_TU_CHAT_ID")
 
 
 # ----------------------------- DATOS -----------------------------
+_cool_until, _cool_lock = {}, threading.Lock()   # fuente -> hasta cuándo no usarla (límite de Binance)
+
+
+def _host(url):
+    return urllib.parse.urlsplit(url).netloc
+
+
+def _cool(url, secs):
+    with _cool_lock:
+        h = _host(url)
+        _cool_until[h] = max(_cool_until.get(h, 0), time.time() + secs)
+
+
+def usable_sources():
+    now = time.time()
+    return [b for b in SOURCES if _cool_until.get(_host(b), 0) <= now] or SOURCES[-1:]
+
+
 def http_get(url, timeout=20):
+    """GET con freno: si Binance avisa que vamos cerca del límite, esa fuente descansa y se usa la siguiente."""
     req = urllib.request.Request(url, headers={"User-Agent": "bridge-tactico-bot"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            used = r.headers.get("X-MBX-USED-WEIGHT-1M")
+            data = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code in (418, 429):  # demasiadas peticiones: descansar antes de que Binance bloquee la IP
+            _cool(url, int(e.headers.get("Retry-After") or (300 if e.code == 418 else 60)))
+        raise
+    limit = 1800 if "fapi." in url else 4800
+    if used and int(used) > limit:
+        _cool(url, 61 - time.time() % 60)
+    return data
+
+
+def fetch_bitunix(symbol, tf, total):
+    """Velas cerradas de Bitunix Futuros (máx. 200 por petición; 3m se arma con velas de 1m)."""
+    now = int(time.time() * 1000)
+    if tf == "3m":
+        out = {}
+        for b in fetch_bitunix(symbol, "1m", total * 3 + 3):
+            k = b["t"] // 180_000 * 180_000
+            x = out.get(k)
+            if not x:
+                out[k] = dict(t=k, o=b["o"], h=b["h"], l=b["l"], c=b["c"], v=b["v"], ct=k + 179_999)
+            else:
+                x["h"], x["l"], x["c"], x["v"] = max(x["h"], b["h"]), min(x["l"], b["l"]), b["c"], x["v"] + b["v"]
+        return [out[k] for k in sorted(out) if out[k]["ct"] < now][-total:]
+    ms, got, end = TF_MS[tf], {}, None
+    while len(got) < total + 1:
+        q = {"symbol": symbol, "interval": tf, "limit": 200}
+        if end:
+            q["endTime"] = end
+        j = http_get(f"{BITUNIX}?{urllib.parse.urlencode(q)}", timeout=30)
+        if j.get("code") != 0:
+            raise RuntimeError(f"Bitunix: {j.get('msg')}")
+        rows = j.get("data") or []
+        for r in rows:
+            t = int(r["time"])
+            got[t] = dict(t=t, o=float(r["open"]), h=float(r["high"]), l=float(r["low"]), c=float(r["close"]),
+                          v=float(r.get("baseVol") or 0), ct=t + ms - 1)
+        if len(rows) < 200:
+            break
+        end = min(int(r["time"]) for r in rows)
+        time.sleep(0.15)
+    _bitunix_syms.add(symbol)
+    return [got[t] for t in sorted(got) if got[t]["ct"] < now][-total:]
 
 
 def fetch_klines(symbol, tf, limit=600):
     q = urllib.parse.urlencode({"symbol": symbol, "interval": tf, "limit": limit})
     last = None
-    for base in SOURCES:
+    for base in ([] if symbol in _bitunix_syms else usable_sources()):
         try:
             rows = http_get(f"{base}?{q}")
             bars = [dict(t=int(k[0]), o=float(k[1]), h=float(k[2]), l=float(k[3]), c=float(k[4]), v=float(k[5]), ct=int(k[6])) for k in rows]
@@ -80,17 +145,25 @@ def fetch_klines(symbol, tf, limit=600):
             return [b for b in bars if b["ct"] < now]  # solo velas cerradas
         except Exception as e:  # probar la siguiente fuente
             last = e
+    try:
+        return fetch_bitunix(symbol, tf, limit)
+    except Exception as e:
+        last = e
     raise RuntimeError(f"No se pudo descargar {symbol} {tf}: {last}")
 
 
 def fetch_long(symbol, tf, total=4500):
     """Historial largo (varias peticiones) para calcular el winrate la primera vez."""
     last = None
-    for base in SOURCES:  # futuros; si no responde (p. ej. servidores de EE. UU.), spot
+    for base in ([] if symbol in _bitunix_syms else usable_sources()):  # futuros; si no responde (EE. UU.), spot
         try:
             return _fetch_long(base, symbol, tf, total)
         except Exception as e:
             last = e
+    try:
+        return fetch_bitunix(symbol, tf, total)
+    except Exception as e:
+        last = e
     raise RuntimeError(f"historial {symbol} {tf}: {last}")
 
 
@@ -347,7 +420,8 @@ def send(token, chat_id, text, buttons=None):
 
 def chart_url(sym, tf):
     tv = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240"}.get(tf, "15")
-    return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{sym}.P&interval={tv}"
+    ex = "" if sym in _bitunix_syms else "BINANCE%3A"
+    return f"https://www.tradingview.com/chart/?symbol={ex}{sym}.P&interval={tv}"
 
 
 def signal_buttons(sym, tf):
@@ -527,6 +601,13 @@ def load_state():
         st["top"], st["mute1m"], st["radar_every"], st["v33"] = int(os.environ.get("TOP", "30")), False, 0, True
     st.setdefault("offset", 0)
     st.setdefault("seen_pairs", [])
+    fav = os.path.join(BASE, "favoritos.txt")  # monedas extra para la PC: una lista separada por comas o líneas
+    if os.environ.get("CLOUD") != "1" and os.path.exists(fav):
+        with open(fav, encoding="utf-8") as f:
+            for x in re.split(r"[,\s]+", f.read()):
+                x = norm_symbol(x) if x.strip() and not x.startswith("#") else ""
+                if x and x not in st["symbols"]:
+                    st["symbols"].append(x)
     if os.environ.get("CLOUD") == "1":  # en GitHub las monedas se cambian en Settings → Variables → SYMBOLS
         st["top"] = int(os.environ.get("TOP", "30"))
         st["symbols"] = [norm_symbol(s) for s in re.split(r"[,\s]+", os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT")) if s.strip()]
@@ -614,7 +695,7 @@ def handle_commands(token, chat, st, ctx):
                 try:
                     fetch_klines(s, "1m", 5)
                 except Exception:
-                    send(token, chat, f"⚠️ {s} no existe en Binance")
+                    send(token, chat, f"⚠️ {s} no existe en Binance ni en Bitunix")
                     continue
                 if s not in st["symbols"]:
                     st["symbols"].append(s)
