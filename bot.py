@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v3.5 (misma lógica que el indicador Bridge Táctico v7.3)
+Bridge Táctico → Telegram  ·  v3.6 (misma lógica que el indicador Bridge Táctico v7.3)
 Vigila tus favoritos en 1m / 3m / 5m / 15m y avisa por Telegram:
   nueva señal LONG/SHORT x/3 con entrada, DCA, SL, TP y CANTIDAD/MARGEN de cada entrada,
   TP1 alcanzado y cierre con el resultado en $.
@@ -350,10 +350,13 @@ def simulate(d, I, capital, risk_pct, dir4=None, dir15=None, low=False):
         close_now, exit_px, reason, exit_fee = False, None, "", FEE_TAKER
         if T and i > T["bar"]:
             s = T["side"]
+            # v3.6: contabilidad por posición real (cada TP cierra un % de lo que REALMENTE está abierto)
             if T["fills"] == 1 and (b["l"] <= T["e2"] if s == 1 else b["h"] >= T["e2"]):
-                T["avg"] = (T["avg"] * T["fw"] + T["e2"] * W[1]) / (T["fw"] + W[1]); T["fw"] += W[1]; T["fills"] = 2
+                T["avg"] = (T["avg"] * T["pos"] + T["e2"] * W[1]) / (T["pos"] + W[1]); T["pos"] += W[1]; T["fills"] = 2
+                T["fees"] += W[1] * FEE_MAKER
             if T["fills"] == 2 and (b["l"] <= T["e3"] if s == 1 else b["h"] >= T["e3"]):
-                T["avg"] = (T["avg"] * T["fw"] + T["e3"] * W[2]) / (T["fw"] + W[2]); T["fw"] += W[2]; T["fills"] = 3
+                T["avg"] = (T["avg"] * T["pos"] + T["e3"] * W[2]) / (T["pos"] + W[2]); T["pos"] += W[2]; T["fills"] = 3
+                T["fees"] += W[2] * FEE_MAKER
             if (b["l"] <= T["sl"]) if s == 1 else (b["h"] >= T["sl"]):
                 close_now, exit_px, reason = True, T["sl"], "stop"
             else:
@@ -361,9 +364,11 @@ def simulate(d, I, capital, risk_pct, dir4=None, dir15=None, low=False):
                     px = T["tps"][k]
                     if (b["h"] >= px) if s == 1 else (b["l"] <= px):
                         if k < 2:
-                            T["real"] += TP_SPLIT[k] * s * (px - T["avg"]) / T["avg"]
-                            T["feeTP"] += TP_SPLIT[k] * FEE_MAKER
-                            T["rem"] -= TP_SPLIT[k]
+                            qk = T["pos"] * TP_SPLIT[k] / T["remS"]  # parte de la posición abierta que cierra este TP
+                            T["real"] += qk * s * (px - T["avg"]) / T["avg"]
+                            T["fees"] += qk * FEE_MAKER
+                            T["pos"] -= qk
+                            T["remS"] -= TP_SPLIT[k]
                             T["tp"] = k + 1
                             if k == 0:
                                 events.append(dict(kind="TP1", bar=i, side=s, price=px, q=T["q"]))
@@ -375,11 +380,11 @@ def simulate(d, I, capital, risk_pct, dir4=None, dir15=None, low=False):
         if T and new_side == -T["side"] and not close_now:
             close_now, exit_px, reason = True, b["c"], "reverse"
         if close_now and T:
-            fee_in = W[0] * FEE_TAKER + (W[1] * FEE_MAKER if T["fills"] >= 2 else 0.0) + (W[2] * FEE_MAKER if T["fills"] >= 3 else 0.0)
-            fee_out = T["fw"] * (T["feeTP"] + T["rem"] * exit_fee)
-            T["real"] += T["rem"] * T["side"] * (exit_px - T["avg"]) / T["avg"]
-            pnl_usd = (T["real"] * T["fw"] - fee_in - fee_out) * T["notional"]
-            events.append(dict(kind="CLOSE", bar=i, entry=T["bar"], side=T["side"], price=exit_px, q=T["q"], win=T["tp"] >= 1, reason=reason, pnl=pnl_usd, r=pnl_usd / risk_usd))
+            T["real"] += T["pos"] * T["side"] * (exit_px - T["avg"]) / T["avg"]
+            T["fees"] += T["pos"] * exit_fee
+            pnl_usd = (T["real"] - T["fees"]) * T["notional"]
+            events.append(dict(kind="CLOSE", bar=i, entry=T["bar"], side=T["side"], price=exit_px, q=T["q"], win=pnl_usd > 0, tp=T["tp"],
+                               reason=reason, pnl=pnl_usd, r=pnl_usd / risk_usd))
             T = None
         if new_side and not T:
             s, e1 = new_side, b["c"]
@@ -396,8 +401,8 @@ def simulate(d, I, capital, risk_pct, dir4=None, dir15=None, low=False):
             notional = risk_usd / worst
             qty = [notional * w / e for w, e in zip(W, (e1, e2, e3))]
             margin = [notional * w / lev for w in W]
-            T = dict(side=s, q=score, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, fw=W[0], fills=1, tp=0,
-                     real=0.0, rem=1.0, feeTP=0.0, notional=notional, lev=lev, qty=qty, margin=margin)
+            T = dict(side=s, q=score, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, pos=W[0], fills=1, tp=0,
+                     real=0.0, remS=1.0, fees=W[0] * FEE_TAKER, notional=notional, lev=lev, qty=qty, margin=margin)
             events.append(dict(kind="OPEN", bar=i, side=s, price=e1, q=score, sl=sl, tps=tps, e2=e2, e3=e3, lev=lev,
                                c=(c1, c2, c3), qty=qty, margin=margin, risk=risk_usd))
     return events, T, last
@@ -454,14 +459,17 @@ def money(p):
     return "$" + fmt(p)
 
 
+def wr_dot(h):
+    """Color según lo que de verdad gana o pierde por operación (R), no solo el % de acierto."""
+    return "⚪" if h["n"] < 5 else "🟢" if h["avg"] >= 0.05 else "🔴" if h["avg"] <= -0.05 else "🟡"
+
+
 def wr_line(h):
-    """Winrate histórico de esa moneda/temporalidad (TP1 alcanzado = ganada, como el panel del indicador)."""
+    """Winrate REAL de esa moneda/temporalidad: operación ganada = cerró con ganancia neta (después de comisiones)."""
     n = h["n"] if h else 0
     if n < 5:
         return "⚪ Winrate: — (sin historial)"
-    w = h["wr"]
-    dot = "🟢" if w >= 60 else "🟡" if w >= 50 else "🔴"
-    return f"{dot} Winrate: {w:.0f}%"
+    return f"{wr_dot(h)} Winrate: {h['wr']:.0f}% · {h['avg']:+.2f} R/op ({n} ops)"
 
 
 def message(sym, tf, ev, extra=None):
@@ -500,9 +508,9 @@ def message(sym, tf, ev, extra=None):
     if ev["kind"] == "TP1":
         return "\n".join([f"✅ <b>TP1 ALCANZADO</b> ✅", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
                           f"🎯 Precio: {money(ev['price'])}", "", "💡 <i>Cierra una parte y deja correr el resto</i>"])
-    res = {"tp3": "🏁 TP3 alcanzado", "stop": "⛔ Stop loss" if not ev["win"] else "🏁 Resto cerrado en SL tras TP",
+    res = {"tp3": "🏁 TP3 alcanzado", "stop": "⛔ Stop loss" if not ev.get("tp") else "🏁 Resto cerrado en SL tras TP",
            "reverse": "🔄 Señal contraria"}[ev["reason"]]
-    lines = ["⏰ <b>OPERACIÓN CERRADA</b> ⏰", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"🔴 Tipo: {s}",
+    lines = ["⏰ <b>OPERACIÓN CERRADA</b> ⏰", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
              f"{'💰' if ev['pnl'] >= 0 else '🩸'} Resultado: {res} · {'+' if ev['pnl'] >= 0 else '-'}${abs(ev['pnl']):,.2f} ({ev['r']:+.2f} R)",
              "", "⚠️ <i>Esta operación ya cerró. No es posible entrar.</i>", "<i>Espera la próxima señal</i> 🚢"]
     return "\n".join(lines)
@@ -597,6 +605,8 @@ def load_state():
         for p in list(st.get("hist", {})):
             if p.endswith(("_1m", "_3m", "_5m")):
                 del st["hist"][p]
+    if not st.get("v36"):  # v3.6: winrate real (contabilidad corregida) → recalcular el historial
+        st["hist"], st["hist_seeded"], st["v36"] = {}, [], True
     if not st.get("v33"):  # v3.3: escanea las 30 monedas con más volumen, avisos de 1m activos, radar solo con /radar
         st["top"], st["mute1m"], st["radar_every"], st["v33"] = int(os.environ.get("TOP", "30")), False, 0, True
     st.setdefault("offset", 0)
@@ -782,7 +792,7 @@ def status_report(st, ctx):
 
 
 def winrate_report(st):
-    lines = ["🏆 <b>Winrate por temporalidad</b> (TP1 alcanzado)"]
+    lines = ["🏆 <b>Winrate real por temporalidad</b> (ganancia neta tras comisiones · R por operación)"]
     for sym in [x for x in active_symbols(st) if any(f"{x}_{t}" in st.get("hist", {}) for t in st["tfs"])]:
         cells = []
         for tf in st["tfs"]:
@@ -790,10 +800,9 @@ def winrate_report(st):
             if h["n"] < 5:
                 cells.append(f"{tf.upper()} ⚪ —")
             else:
-                dot = "🟢" if h["wr"] >= 60 else "🟡" if h["wr"] >= 50 else "🔴"
-                cells.append(f"{tf.upper()} {dot} {h['wr']:.0f}% ({h['n']})")
+                cells.append(f"{tf.upper()} {wr_dot(h)} {h['wr']:.0f}% · {h['avg']:+.2f}R ({h['n']})")
         lines.append(f"<b>{coin(sym)}</b>\n  " + "\n  ".join(cells))
-    lines.append("\n🟢 ≥60 % · 🟡 50-59 % · 🔴 <50 % · ⚪ menos de 5 operaciones")
+    lines.append("\n🟢 gana ≥ +0.05 R/op · 🟡 ~0 · 🔴 pierde · ⚪ menos de 5 operaciones")
     return "\n".join(lines)
 
 
