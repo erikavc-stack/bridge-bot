@@ -319,8 +319,20 @@ def tg(token, method, params=None, timeout=20):
         return json.loads(r.read().decode())
 
 
-def send(token, chat_id, text):
-    return tg(token, "sendMessage", {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"})
+def send(token, chat_id, text, buttons=None):
+    p = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": "true"}
+    if buttons:  # botones bajo el mensaje: [[(texto, url), ...], ...]
+        p["reply_markup"] = json.dumps({"inline_keyboard": [[{"text": t, "url": u} for t, u in row] for row in buttons]})
+    return tg(token, "sendMessage", p)
+
+
+def chart_url(sym, tf):
+    tv = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240"}.get(tf, "15")
+    return f"https://www.tradingview.com/chart/?symbol=BINANCE%3A{sym}.P&interval={tv}"
+
+
+def signal_buttons(sym, tf):
+    return [[("📈 Ver gráfico " + tf.upper(), chart_url(sym, tf))]]
 
 
 def fmt(p):
@@ -353,62 +365,53 @@ def wr_line(h):
     """Winrate histórico de esa moneda/temporalidad (TP1 alcanzado = ganada, como el panel del indicador)."""
     n = h["n"] if h else 0
     if n < 5:
-        return f"⚪ Winrate: sin historial suficiente ({n} ops)"
+        return "⚪ Winrate: — (sin historial)"
     w = h["wr"]
     dot = "🟢" if w >= 60 else "🟡" if w >= 50 else "🔴"
-    return f"{dot} Winrate: <b>{w:.0f}%</b> ({n} ops · {h['avg']:+.2f} R/op)"
+    return f"{dot} Winrate: {w:.0f}%"
 
 
 def message(sym, tf, ev, extra=None):
+    """Mensajes con el mismo formato que el Radar de Aurolo."""
     extra = extra or {}
     s = "LONG" if ev["side"] == 1 else "SHORT"
     icon = "🟢" if ev["side"] == 1 else "🔴"
     pair, TF = sym + ".P", tf.upper()
+    link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     if ev["kind"] == "OPEN":
-        c1, c2, c3 = ev["c"]
         e1 = ev["price"]
         pct = lambda x: f"{(x - e1) / e1 * 100:+.2f}%"
         q1, q2, q3 = (fq(x) for x in ev["qty"])
-        m1, m2, m3 = ev["margin"]
-        lines = [f"{icon} <b>{s} {pair} {TF}</b> {icon}", "",
+        lines = [f"{icon} <b>{s}</b> {link} {icon}", "",
                  "📡 <b>OBJETIVO DETECTADO:</b>",
-                 f"├ 💰 Entrada: <b>{money(e1)}</b>",
-                 f"├ 💰 DCA: E2: {money(ev['e2'])} · E3: {money(ev['e3'])}",
-                 f"├ 🛟 Stop Loss: {money(ev['sl'])} ({pct(ev['sl'])})",
-                 f"├ ⚡ Apalancamiento: {ev['lev']}x",
-                 f"├ ⭐ Calidad: {ev['q']}/3 (Tend {'✓' if c1 else '✗'} · Mom·ADX {'✓' if c2 else '✗'} · WT {'✓' if c3 else '✗'})",
-                 f"└ {wr_line(extra.get('hist'))}", "",
+                 f"├── 💰 Entrada: {money(e1)}",
+                 f"├── 💰 DCA: E2: {money(ev['e2'])} · E3: {money(ev['e3'])}",
+                 f"├── 🛟 Stop Loss: {money(ev['sl'])} ({pct(ev['sl'])})",
+                 f"├── ⚡ Apalancamiento: {ev['lev']}x",
+                 f"└── {wr_line(extra.get('hist'))}", "",
                  "🎯 <b>TAKE PROFITS:</b>",
-                 f"├ TP1 (40%): {money(ev['tps'][0])} ({pct(ev['tps'][0])})",
-                 f"├ TP2 (30%): {money(ev['tps'][1])} ({pct(ev['tps'][1])})"]
+                 f"├── TP1: {money(ev['tps'][0])} ({pct(ev['tps'][0])})",
+                 f"├── TP2: {money(ev['tps'][1])} ({pct(ev['tps'][1])})"]
         tgt = extra.get("htf_tp")
         if tgt:
-            lines.append(f"├ TP3 (30%): {money(ev['tps'][2])} ({pct(ev['tps'][2])})")
-            lines.append(f"└ 1er TP ({tgt[0]}): {money(tgt[1])} ({pct(tgt[1])})")
+            lines.append(f"└── 1er TP ({tgt[0]}): {money(tgt[1])} ({pct(tgt[1])})")
         else:
-            lines.append(f"└ TP3 (30%): {money(ev['tps'][2])} ({pct(ev['tps'][2])})")
-        lines += ["", f"📦 <b>TAMAÑO</b> (riesgo ${ev['risk']:,.2f}):",
-                  f"├ E1: {q1} {coin(sym)} · margen ${m1:,.2f}",
-                  f"├ E2: {q2} {coin(sym)} · margen ${m2:,.2f}",
-                  f"└ E3: {q3} {coin(sym)} · margen ${m3:,.2f}"]
-        dirs = extra.get("dirs")
-        if dirs:
-            lines += ["", "📊 <b>TEMPORALIDADES:</b>", " · ".join(f"{t.upper()} {'▲' if u else '▼'}" for t, u in dirs)]
-        lines += ["", "⚓ <b>ESTRATEGIA:</b>",
-                  "├ E2, E3 y TP con orden límite (paga menos comisión)",
-                  "└ ⏰ Salir cuando llegue el aviso de cierre"]
+            lines.append(f"└── TP3: {money(ev['tps'][2])} ({pct(ev['tps'][2])})")
+        lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk']:,.0f}):",
+                  f"└── E1: {q1} · E2: {q2} · E3: {q3} {coin(sym)}", "",
+                  "⚓ <b>ESTRATEGIA:</b>",
+                  "└── ⏰ Salir cuando indique señal de tiempo", "",
+                  "📻 <i>¿Disparas?</i>",
+                  "⚓ Opera en Bitunix · E2, E3 y TP con orden límite"]
         return "\n".join(lines)
     if ev["kind"] == "TP1":
-        return (f"✅ <b>TP1 ALCANZADO</b> ✅\n\n📊 Par: {pair}\n⏰ Temporalidad: {TF}\n{icon} Tipo: {s}\n"
-                f"🎯 Precio: {money(ev['price'])}\n\n💡 Cierra el 40 % y deja correr el resto")
-    res = {"tp3": "🏁 TP3 — operación completa", "stop": "⛔ Stop loss" if not ev["win"] else "🏁 Resto cerrado en SL tras TP",
-           "reverse": "🔄 Cerrada por señal contraria"}[ev["reason"]]
-    lines = ["⏰ <b>OPERACIÓN CERRADA</b> ⏰", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s} {ev['q']}/3",
-             f"{res} · {money(ev['price'])}",
-             f"{'💰' if ev['pnl'] >= 0 else '🩸'} Resultado: {'+' if ev['pnl'] >= 0 else '-'}${abs(ev['pnl']):,.2f} ({ev['r']:+.2f} R)"]
-    if extra.get("hist"):
-        lines += ["", wr_line(extra["hist"]).replace("Winrate:", f"Winrate {TF}:")]
-    lines += ["", "⚠️ <i>Esta operación ya cerró. Espera la próxima señal.</i>"]
+        return "\n".join([f"✅ <b>TP1 ALCANZADO</b> ✅", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
+                          f"🎯 Precio: {money(ev['price'])}", "", "💡 <i>Cierra una parte y deja correr el resto</i>"])
+    res = {"tp3": "🏁 TP3 alcanzado", "stop": "⛔ Stop loss" if not ev["win"] else "🏁 Resto cerrado en SL tras TP",
+           "reverse": "🔄 Señal contraria"}[ev["reason"]]
+    lines = ["⏰ <b>OPERACIÓN CERRADA</b> ⏰", "", f"📊 Par: {pair}", f"⏰ Temporalidad: {TF}", f"🔴 Tipo: {s}",
+             f"{'💰' if ev['pnl'] >= 0 else '🩸'} Resultado: {res} · {'+' if ev['pnl'] >= 0 else '-'}${abs(ev['pnl']):,.2f} ({ev['r']:+.2f} R)",
+             "", "⚠️ <i>Esta operación ya cerró. No es posible entrar.</i>", "<i>Espera la próxima señal</i> 🚢"]
     return "\n".join(lines)
 
 
@@ -495,6 +498,10 @@ def load_state():
     st.setdefault("h4", os.environ.get("USE_H4", "0") == "1")
     st.setdefault("offset", 0)
     st.setdefault("seen_pairs", [])
+    if os.environ.get("CLOUD") == "1":  # en GitHub las monedas se cambian en Settings → Variables → SYMBOLS
+        st["symbols"] = [norm_symbol(s) for s in re.split(r"[,\s]+", os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT")) if s.strip()]
+        st["tfs"] = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m,1h").split(",") if t.strip()]
+        st["v31"] = True
     if not st.get("v31"):  # v3.1: también vigila 1h
         if "1h" not in st["tfs"]:
             st["tfs"].append("1h")
@@ -545,6 +552,7 @@ HELP = ("🤖 <b>Bridge Táctico · comandos</b>\n"
         "/capital 2000 → tu capital en $ (para calcular cantidades)\n"
         "/riesgo 2 → % de riesgo por operación\n"
         "/h4 si | no → filtro de tendencia 4h en 1m-5m (menos señales, más acierto)\n"
+        "/nube si | no → 15m y 1h los avisa GitHub (evita avisos repetidos)\n"
         "/ayuda → este mensaje")
 
 
@@ -612,6 +620,10 @@ def handle_commands(token, chat, st, ctx):
             send(token, chat, radar_report(st, ctx))
         elif cmd == "/winrate":
             send(token, chat, winrate_report(st))
+        elif cmd == "/nube":
+            if args:
+                st["quiet"] = ["15m", "1h"] if args[0].lower() in ("si", "sí", "on", "1", "s") else []
+            send(token, chat, "☁️ 15m y 1h: " + ("los avisa GitHub (la PC solo 1m-5m, sin repetidos)" if st.get("quiet") else "los avisa esta PC"))
 
 
 def status_report(st, ctx):
@@ -751,11 +763,11 @@ def process(sym, tf, st, ctx, token, chat, notify=True):
         if key in sent:
             continue
         recent = now - d[ev["bar"]]["ct"] <= 2 * TF_MS.get(tf, 900_000) + 120_000
-        if notify and recent and not first_time:
+        if notify and recent and not first_time and tf not in st.get("quiet", []):
             extra = {"hist": hist_stats(st, pair)}
             if ev["kind"] == "OPEN":
                 extra.update(open_extras(sym, tf, ev, ctx))
-            send(token, chat, message(sym, tf, ev, extra))
+            send(token, chat, message(sym, tf, ev, extra), signal_buttons(sym, tf) if ev["kind"] == "OPEN" else None)
         sent.add(key)
     st["sent"] = list(sent)
     if first_time:
