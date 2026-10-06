@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v3.1 (misma lógica que el indicador Bridge Táctico v7.3)
+Bridge Táctico → Telegram  ·  v3.3 (misma lógica que el indicador Bridge Táctico v7.3)
 Vigila tus favoritos en 1m / 3m / 5m / 15m y avisa por Telegram:
   nueva señal LONG/SHORT x/3 con entrada, DCA, SL, TP y CANTIDAD/MARGEN de cada entrada,
   TP1 alcanzado y cierre con el resultado en $.
@@ -34,11 +34,21 @@ ZONE_ATR, TOUCH_WIN = 1.25, 6
 SQZ_LEN, ADX_LEN = 20, 14
 WT_N1, WT_N2, WT_LVL, WT_WIN = 10, 21, 40.0, 3
 MIN_TRADE, USE_EMA, EMA_LEN = 2, True, 200
-DCA_W = (0.20, 0.30, 0.50)        # E1 20 % · E2 30 % · E3 50 %
+DCA_W = (0.20, 0.30, 0.50)        # E1 20 % · E2 30 % · E3 50 %  (15m y más)
+LOW_W = (0.10, 0.30, 0.60)        # modo preciso 3m/5m: E1 10 % · E2 30 % · E3 60 %
+LOW_MIN_DIST = 0.45               # modo preciso 3m/5m: SL mínimo 0.45 %
 DCA_ATR, SL_ATR = 1.0, 1.0
 TP_R = (0.5, 1.0, 2.0)
 TP_SPLIT = (0.40, 0.30, 0.30)
-MAX_LEV, LOSS_MARGIN_PCT = 50, 80.0
+MAX_LEV, LOSS_MARGIN_PCT = 50, 50.0   # apalancamiento recomendado: si toca el SL pierdes ~50 % del margen
+LEV_STEPS = (5, 10, 15, 20, 25, 30, 40, 50)
+
+
+def rec_leverage(worst):
+    """Apalancamiento recomendado según la distancia al stop de ESA moneda (redondeado hacia abajo a 5/10/15/20/25/30/40/50x)."""
+    raw = LOSS_MARGIN_PCT / max(worst * 100, 0.01)
+    ok = [x for x in LEV_STEPS if x <= min(raw, MAX_LEV)]
+    return ok[-1] if ok else LEV_STEPS[0]
 MIN_DIST = float(os.environ.get("MIN_DIST", "0.6"))           # % mínimo entre entrada media y SL
 FEE_TAKER = float(os.environ.get("FEE_TAKER", "0.06")) / 100  # E1 a mercado y stop
 FEE_MAKER = float(os.environ.get("FEE_MAKER", "0.02")) / 100  # E2/E3 y TP con orden límite
@@ -207,19 +217,28 @@ def indicators(d):
 _h4_cache = {}
 
 
-def dir4_series(sym, d):
-    bucket = int(time.time() * 1000) // H4_MS
-    c = _h4_cache.get(sym)
+def dir_series(sym, d, htf="4h"):
+    """Dirección de la Tendencial de una temporalidad mayor en su última vela CERRADA (1 alcista, -1 bajista)."""
+    ms = TF_MS[htf]
+    bucket = int(time.time() * 1000) // ms
+    c = _h4_cache.get((sym, htf))
     if not c or c[0] != bucket:
-        k4 = fetch_klines(sym, "4h", 300)
-        _, di4 = supertrend(k4, ST_FACTOR, ST_ATR)
-        _h4_cache[sym] = (bucket, {b["t"]: (1 if di4[j] < 0 else -1) for j, b in enumerate(k4)})
-    m = _h4_cache[sym][1]
-    return [m.get((b["t"] // H4_MS - 1) * H4_MS) for b in d]
+        kk = fetch_klines(sym, htf, 1500)
+        _, dh = supertrend(kk, ST_FACTOR, ST_ATR)
+        _h4_cache[(sym, htf)] = (bucket, {b["t"]: (1 if dh[j] < 0 else -1) for j, b in enumerate(kk)})
+    m = _h4_cache[(sym, htf)][1]
+    return [m.get((b["t"] // ms - 1) * ms) for b in d]
+
+
+def dir4_series(sym, d):
+    return dir_series(sym, d, "4h")
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dir4=None):
+def simulate(d, I, capital, risk_pct, dir4=None, dir15=None, low=False):
+    """low=True: modo preciso de 3m/5m (backtest 8 monedas: 3m +0.25 → +0.54 R/op, 5m +0.25 → +0.46 R/op)."""
+    W = LOW_W if low else DCA_W
+    min_dist = LOW_MIN_DIST if low else MIN_DIST
     st, di, atr, mom, adx, wt1, wt2, e200 = (I[k] for k in ("st", "dir", "atr", "mom", "adx", "wt1", "wt2", "ema"))
     events = []
     last_zone, zone_side, fired = -10**9, 0, False
@@ -247,7 +266,7 @@ def simulate(d, I, capital, risk_pct, dir4=None):
         c3 = (i - last_xup <= WT_WIN) if up else (i - last_xdn <= WT_WIN)
         score = 1 + int(c2) + int(c3)
         ok_ema = (not USE_EMA) or (b["c"] > e200[i] if up else b["c"] < e200[i])
-        ok_h4 = dir4 is None or dir4[i] == side
+        ok_h4 = (dir4 is None or dir4[i] == side) and (dir15 is None or dir15[i] == side)
         sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_h4
         if sig:
             fired = True
@@ -259,9 +278,9 @@ def simulate(d, I, capital, risk_pct, dir4=None):
         if T and i > T["bar"]:
             s = T["side"]
             if T["fills"] == 1 and (b["l"] <= T["e2"] if s == 1 else b["h"] >= T["e2"]):
-                T["avg"] = (T["avg"] * T["fw"] + T["e2"] * DCA_W[1]) / (T["fw"] + DCA_W[1]); T["fw"] += DCA_W[1]; T["fills"] = 2
+                T["avg"] = (T["avg"] * T["fw"] + T["e2"] * W[1]) / (T["fw"] + W[1]); T["fw"] += W[1]; T["fills"] = 2
             if T["fills"] == 2 and (b["l"] <= T["e3"] if s == 1 else b["h"] >= T["e3"]):
-                T["avg"] = (T["avg"] * T["fw"] + T["e3"] * DCA_W[2]) / (T["fw"] + DCA_W[2]); T["fw"] += DCA_W[2]; T["fills"] = 3
+                T["avg"] = (T["avg"] * T["fw"] + T["e3"] * W[2]) / (T["fw"] + W[2]); T["fw"] += W[2]; T["fills"] = 3
             if (b["l"] <= T["sl"]) if s == 1 else (b["h"] >= T["sl"]):
                 close_now, exit_px, reason = True, T["sl"], "stop"
             else:
@@ -283,7 +302,7 @@ def simulate(d, I, capital, risk_pct, dir4=None):
         if T and new_side == -T["side"] and not close_now:
             close_now, exit_px, reason = True, b["c"], "reverse"
         if close_now and T:
-            fee_in = DCA_W[0] * FEE_TAKER + (DCA_W[1] * FEE_MAKER if T["fills"] >= 2 else 0.0) + (DCA_W[2] * FEE_MAKER if T["fills"] >= 3 else 0.0)
+            fee_in = W[0] * FEE_TAKER + (W[1] * FEE_MAKER if T["fills"] >= 2 else 0.0) + (W[2] * FEE_MAKER if T["fills"] >= 3 else 0.0)
             fee_out = T["fw"] * (T["feeTP"] + T["rem"] * exit_fee)
             T["real"] += T["rem"] * T["side"] * (exit_px - T["avg"]) / T["avg"]
             pnl_usd = (T["real"] * T["fw"] - fee_in - fee_out) * T["notional"]
@@ -294,17 +313,17 @@ def simulate(d, I, capital, risk_pct, dir4=None):
             e2 = st[i]
             e3 = st[i] - s * DCA_ATR * atr[i]
             sl = e3 - s * SL_ATR * atr[i]
-            avg_all = e1 * DCA_W[0] + e2 * DCA_W[1] + e3 * DCA_W[2]
+            avg_all = e1 * W[0] + e2 * W[1] + e3 * W[2]
             worst = max(abs(avg_all - sl) / avg_all, 1e-4)
-            if worst * 100 < MIN_DIST:
+            if worst * 100 < min_dist:
                 continue  # stop demasiado corto: la comisión se come la ganancia
-            lev = max(1, min(MAX_LEV, int(math.floor(LOSS_MARGIN_PCT / (worst * 100)))))
+            lev = rec_leverage(worst)
             R = abs(e1 - sl)
             tps = [e1 + s * R * r for r in TP_R]
             notional = risk_usd / worst
-            qty = [notional * w / e for w, e in zip(DCA_W, (e1, e2, e3))]
-            margin = [notional * w / lev for w in DCA_W]
-            T = dict(side=s, q=score, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, fw=DCA_W[0], fills=1, tp=0,
+            qty = [notional * w / e for w, e in zip(W, (e1, e2, e3))]
+            margin = [notional * w / lev for w in W]
+            T = dict(side=s, q=score, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, fw=W[0], fills=1, tp=0,
                      real=0.0, rem=1.0, feeTP=0.0, notional=notional, lev=lev, qty=qty, margin=margin)
             events.append(dict(kind="OPEN", bar=i, side=s, price=e1, q=score, sl=sl, tps=tps, e2=e2, e3=e3, lev=lev,
                                c=(c1, c2, c3), qty=qty, margin=margin, risk=risk_usd))
@@ -387,7 +406,7 @@ def message(sym, tf, ev, extra=None):
                  f"├── 💰 Entrada: {money(e1)}",
                  f"├── 💰 DCA: E2: {money(ev['e2'])} · E3: {money(ev['e3'])}",
                  f"├── 🛟 Stop Loss: {money(ev['sl'])} ({pct(ev['sl'])})",
-                 f"├── ⚡ Apalancamiento: {ev['lev']}x",
+                 f"├── ⚡ Apalancamiento recomendado: <b>{ev['lev']}x</b>",
                  f"└── {wr_line(extra.get('hist'))}", "",
                  "🎯 <b>TAKE PROFITS:</b>",
                  f"├── TP1: {money(ev['tps'][0])} ({pct(ev['tps'][0])})",
@@ -495,10 +514,21 @@ def load_state():
     st.setdefault("tfs", [t.strip() for t in os.environ.get("TIMEFRAMES", "1m,3m,5m,15m,1h").split(",") if t.strip()])
     st.setdefault("capital", float(os.environ.get("CAPITAL", "2000")))
     st.setdefault("risk", float(os.environ.get("RISK_PCT", "2")))
-    st.setdefault("h4", os.environ.get("USE_H4", "0") == "1")
+    st.setdefault("h4", True)
+    st.setdefault("radar_every", 0)
+    st.setdefault("top", int(os.environ.get("TOP", "30")))
+    if not st.get("v32"):  # v3.2: modo preciso de 3m/5m activado y 1m sin avisos (no es rentable)
+        st["h4"], st["mute1m"], st["v32"] = True, True, True
+        st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(("_1m", "_3m", "_5m"))]
+        for p in list(st.get("hist", {})):
+            if p.endswith(("_1m", "_3m", "_5m")):
+                del st["hist"][p]
+    if not st.get("v33"):  # v3.3: escanea las 30 monedas con más volumen, avisos de 1m activos, radar solo con /radar
+        st["top"], st["mute1m"], st["radar_every"], st["v33"] = int(os.environ.get("TOP", "30")), False, 0, True
     st.setdefault("offset", 0)
     st.setdefault("seen_pairs", [])
     if os.environ.get("CLOUD") == "1":  # en GitHub las monedas se cambian en Settings → Variables → SYMBOLS
+        st["top"] = int(os.environ.get("TOP", "30"))
         st["symbols"] = [norm_symbol(s) for s in re.split(r"[,\s]+", os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT")) if s.strip()]
         st["tfs"] = [t.strip() for t in os.environ.get("TIMEFRAMES", "15m,1h").split(",") if t.strip()]
         st["v31"] = True
@@ -537,21 +567,24 @@ def parse_num(args, amount=False):
 
 def settings_line(st):
     return (f"💰 ${st['capital']:,.0f} · riesgo {st['risk']:g}% = ${st['capital'] * st['risk'] / 100:,.2f} por operación\n"
-            f"🛡 SL mínimo {MIN_DIST:g}% · 🧭 filtro 4h en 1m-5m: {'sí' if st['h4'] else 'no'}")
+            f"🛡 SL mínimo {MIN_DIST:g}% · 🎯 modo preciso 3m/5m: {'sí' if st['h4'] else 'no'} · avisos 1m: {'no' if st.get('mute1m', False) else 'sí'} · monedas: favoritas + top {st.get('top', 0)}")
 
 
 # ----------------------------- COMANDOS DE TELEGRAM -----------------------------
 HELP = ("🤖 <b>Bridge Táctico · comandos</b>\n"
         "/radar → todas tus monedas y temporalidades de un vistazo\n"
+        "/radar cada 30 · /radar off → radar automático (por defecto cada 60 min)\n"
         "/estado → detalle: tendencia y operaciones activas\n"
         "/winrate → acierto de cada moneda en cada temporalidad\n"
+        "/top 30 → además de tus favoritas, vigila las 30 monedas con más volumen (0 = solo favoritas)\n"
         "/agregar SOL XRP → añade a favoritos\n"
         "/quitar SOL → quita de favoritos\n"
         "/lista → favoritos y ajustes\n"
         "/tf 1m 3m 5m 15m → temporalidades a vigilar\n"
         "/capital 2000 → tu capital en $ (para calcular cantidades)\n"
         "/riesgo 2 → % de riesgo por operación\n"
-        "/h4 si | no → filtro de tendencia 4h en 1m-5m (menos señales, más acierto)\n"
+        "/h4 si | no → modo preciso 3m/5m: solo a favor de 15m y 4h (activado)\n"
+        "/1m si | no → avisos de 1m (apagados: pierden por comisiones)\n"
         "/nube si | no → 15m y 1h los avisa GitHub (evita avisos repetidos)\n"
         "/ayuda → este mensaje")
 
@@ -611,15 +644,33 @@ def handle_commands(token, chat, st, ctx):
         elif cmd == "/h4":
             if args:
                 st["h4"] = args[0].lower() in ("si", "sí", "on", "1", "yes", "y", "s")
-            send(token, chat, "🧭 Filtro 4h en 1m-5m: " + ("<b>ACTIVADO</b> (solo opera a favor de la Tendencial de 4h)" if st["h4"] else "desactivado"))
+            send(token, chat, "🎯 Modo preciso 3m/5m: " + ("<b>ACTIVADO</b> (solo a favor de la Tendencial de 15m y 4h · DCA 10/30/60 · SL mín 0.45 %)" if st["h4"] else "desactivado"))
+        elif cmd == "/1m":
+            if args:
+                st["mute1m"] = args[0].lower() not in ("si", "sí", "on", "1", "s")
+            send(token, chat, "⏱ Avisos de 1m: " + ("desactivados (en el backtest pierden por comisiones)" if st.get("mute1m", False) else "<b>activados</b> ⚠️ en el backtest 1m pierde por comisiones: fíjate en su winrate"))
         elif cmd == "/lista":
             send(token, chat, "⭐ Favoritos: " + ", ".join(st["symbols"]) + "\n⏱ Temporalidades: " + ", ".join(st["tfs"]) + "\n" + settings_line(st))
         elif cmd == "/estado":
             send(token, chat, status_report(st, ctx))
         elif cmd == "/radar":
-            send(token, chat, radar_report(st, ctx))
+            if args and args[0].lower() in ("off", "no", "apagar"):
+                st["radar_every"] = 0
+                send(token, chat, "📡 Radar automático: apagado (escribe /radar cuando lo quieras)")
+            elif args:
+                v = parse_num(args[1:] if args[0].lower() == "cada" else args)
+                if v and v >= 5:
+                    st["radar_every"] = int(v)
+                send(token, chat, f"📡 Radar automático cada {st.get('radar_every', 60)} min")
+            else:
+                send(token, chat, radar_report(st, ctx))
         elif cmd == "/winrate":
             send(token, chat, winrate_report(st))
+        elif cmd == "/top":
+            v = parse_num(args)
+            if v is not None and 0 <= v <= 60:
+                st["top"] = int(v)
+            send(token, chat, f"🔎 Escaneo: tus favoritas + las {st.get('top', 0)} monedas con más volumen ({len(active_symbols(st))} en total)")
         elif cmd == "/nube":
             if args:
                 st["quiet"] = ["15m", "1h"] if args[0].lower() in ("si", "sí", "on", "1", "s") else []
@@ -651,7 +702,7 @@ def status_report(st, ctx):
 
 def winrate_report(st):
     lines = ["🏆 <b>Winrate por temporalidad</b> (TP1 alcanzado)"]
-    for sym in st["symbols"]:
+    for sym in [x for x in active_symbols(st) if any(f"{x}_{t}" in st.get("hist", {}) for t in st["tfs"])]:
         cells = []
         for tf in st["tfs"]:
             h = hist_stats(st, f"{sym}_{tf}")
@@ -729,58 +780,111 @@ def open_extras(sym, tf, ev, ctx):
     return {"dirs": dirs, "htf_tp": tgt}
 
 
-def process(sym, tf, st, ctx, token, chat, notify=True):
-    now = int(time.time() * 1000)
+# ----------------------------- MONEDAS: favoritas + las de más volumen (como el radar de Aurolo) -----------------------------
+_top_cache = {"t": 0, "list": []}
+EXCLUDE = {"USDCUSDT", "BTCDOMUSDT", "DEFIUSDT", "FDUSDUSDT", "TUSDUSDT"}
+
+
+def top_symbols(n):
+    if n <= 0:
+        return []
+    if time.time() - _top_cache["t"] > 3600 or len(_top_cache["list"]) < n:
+        for url in ("https://fapi.binance.com/fapi/v1/ticker/24hr", "https://data-api.binance.vision/api/v3/ticker/24hr"):
+            try:
+                rows = http_get(url, timeout=30)
+                rows = [r for r in rows if r["symbol"].endswith("USDT") and r["symbol"] not in EXCLUDE and float(r.get("quoteVolume", 0)) > 0]
+                rows.sort(key=lambda r: float(r["quoteVolume"]), reverse=True)
+                _top_cache.update(t=time.time(), list=[r["symbol"] for r in rows[:60]])
+                break
+            except Exception as e:
+                print("top:", e)
+    return _top_cache["list"][:n]
+
+
+def active_symbols(st):
+    out = list(st["symbols"])
+    for x in top_symbols(int(st.get("top", 0))):
+        if x not in out:
+            out.append(x)
+    return out
+
+
+# ----------------------------- ESCANEO (en paralelo) -----------------------------
+def compute(sym, tf, st):
+    """Descarga y calcula una moneda/temporalidad. No toca el estado (se puede ejecutar en paralelo)."""
+    pair = f"{sym}_{tf}"
     d = fetch_klines(sym, tf, 1000)
     I = indicators(d)
-    dir4 = dir4_series(sym, d) if st.get("h4") and TF_MS.get(tf, 0) <= 300_000 else None
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dir4)
-    ctx[(sym, tf)] = {"up": I["dir"][-1] < 0, "st": I["st"][-1], "T": T, "pts": last["pts"]}
-    pair = f"{sym}_{tf}"
-    # historial de operaciones cerradas (para el winrate); ignora las primeras velas sin calentar
-    H = st.setdefault("hist", {}).setdefault(pair, {})
-    seeded = st.setdefault("hist_seeded", [])
-    if pair not in seeded:  # la primera vez: winrate con un historial largo
+    low = st.get("h4", True) and TF_MS.get(tf, 0) <= 300_000  # modo preciso en 1m/3m/5m
+    dir4 = dir_series(sym, d, "4h") if low else None
+    dir15 = dir_series(sym, d, "15m") if low else None
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dir4, dir15, low)
+    seed = None
+    if pair not in st.get("hist_seeded", []):  # la primera vez: winrate con un historial largo
         try:
-            dl = fetch_long(sym, tf)
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dir4_series(sym, dl) if dir4 is not None else None)
-            for ev in evl:
-                if ev["kind"] == "CLOSE" and ev["entry"] >= 250:
-                    H.setdefault(str(dl[ev["entry"]]["t"]), [1 if ev["win"] else 0, round(ev["r"], 3)])
-            seeded.append(pair)
+            dl = fetch_long(sym, tf, 3000)
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dir_series(sym, dl, "4h") if low else None,
+                                 dir_series(sym, dl, "15m") if low else None, low)
+            seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3)) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
-    for ev in events:
+    return dict(sym=sym, tf=tf, d=d, up=I["dir"][-1] < 0, st=I["st"][-1], events=events, T=T, pts=last["pts"], seed=seed)
+
+
+def apply(res, st, ctx, token, chat, notify=True):
+    """Guarda el resultado y envía a Telegram cada señal por separado (una por moneda y temporalidad)."""
+    sym, tf, d = res["sym"], res["tf"], res["d"]
+    pair = f"{sym}_{tf}"
+    ctx[(sym, tf)] = {"up": res["up"], "st": res["st"], "T": res["T"], "pts": res["pts"]}
+    H = st.setdefault("hist", {}).setdefault(pair, {})
+    if res["seed"] is not None:
+        for k, w, r in res["seed"]:
+            H.setdefault(k, [w, r])
+        st.setdefault("hist_seeded", []).append(pair)
+    for ev in res["events"]:
         if ev["kind"] == "CLOSE" and ev["entry"] >= 250:
             H.setdefault(str(d[ev["entry"]]["t"]), [1 if ev["win"] else 0, round(ev["r"], 3)])
-    if len(H) > 300:
-        for k in sorted(H, key=int)[:-300]:
+    if len(H) > 150:
+        for k in sorted(H, key=int)[:-150]:
             del H[k]
+    now = int(time.time() * 1000)
     first_time = pair not in st["seen_pairs"]
     sent = set(st["sent"])
-    for ev in events:
+    muted = set(st.get("quiet", [])) | ({"1m"} if st.get("mute1m", False) else set())
+    for ev in res["events"]:
         key = f"{sym}_{tf}_{d[ev['bar']]['t']}_{ev['kind']}"
         if key in sent:
             continue
         recent = now - d[ev["bar"]]["ct"] <= 2 * TF_MS.get(tf, 900_000) + 120_000
-        if notify and recent and not first_time and tf not in st.get("quiet", []):
+        if notify and recent and not first_time and tf not in muted:
             extra = {"hist": hist_stats(st, pair)}
             if ev["kind"] == "OPEN":
                 extra.update(open_extras(sym, tf, ev, ctx))
-            send(token, chat, message(sym, tf, ev, extra), signal_buttons(sym, tf) if ev["kind"] == "OPEN" else None)
+            try:
+                send(token, chat, message(sym, tf, ev, extra), signal_buttons(sym, tf) if ev["kind"] == "OPEN" else None)
+                print(time.strftime("%H:%M:%S"), "enviado", ev["kind"], sym, tf)
+            except Exception as e:
+                print("telegram:", e)
+                continue  # se reintenta en la próxima vuelta
         sent.add(key)
     st["sent"] = list(sent)
     if first_time:
         st["seen_pairs"].append(pair)
 
 
-def run_once(token, chat, st, ctx):
-    for sym in list(st["symbols"]):
-        for tf in st["tfs"]:
+def scan(pairs, st, ctx, token, chat):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futs = [(sym, tf, ex.submit(compute, sym, tf, st)) for sym, tf in pairs]
+        for sym, tf, f in futs:
             try:
-                process(sym, tf, st, ctx, token, chat)
+                apply(f.result(), st, ctx, token, chat)
             except Exception as e:
                 print(f"⚠️ {sym} {tf}: {e}")
+
+
+def run_once(token, chat, st, ctx):
+    scan([(s, t) for s in active_symbols(st) for t in st["tfs"]], st, ctx, token, chat)
 
 
 def main():
@@ -795,14 +899,16 @@ def main():
         if os.environ.get("COMMANDS", "1") == "1":  # en la nube se apaga para no robarle los comandos al bot de la PC
             handle_commands(token, chat, st, ctx)
         if not st["init"] or os.environ.get("TEST") == "1":
-            send(token, chat, ("🤖 <b>Bridge Táctico — bot activo</b>\n" if not st["init"] else "🧪 <b>Prueba</b>\n") + radar_report(st, ctx))
+            send(token, chat, ("🤖 <b>Bridge Táctico (nube) activo</b>" if not st["init"] else "🧪 <b>Prueba nube OK</b>") +
+                 f"\nVigilando {len(active_symbols(st))} monedas en {', '.join(t.upper() for t in st['tfs'])}. Cada señal llega en su propio mensaje.")
         st["init"] = True
         save_state(st, int(time.time() * 1000))
         return
 
     print("Bridge Táctico bot en marcha (cierra la ventana o Ctrl+C para detener)…")
     run_once(token, chat, st, ctx)
-    send(token, chat, "🤖 <b>Bridge Táctico — bot activo (scalping)</b>\n" + radar_report(st, ctx) + "\n\n" + settings_line(st) + "\n\nEscribe /ayuda para ver los comandos.")
+    send(token, chat, f"🤖 <b>Bridge Táctico activo</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(t.upper() for t in st['tfs'])}.\n"
+                      "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) + "\n\nEscribe /ayuda para ver los comandos.")
     st["init"] = True
     save_state(st, int(time.time() * 1000))
     last_min = None
@@ -813,16 +919,17 @@ def main():
             minute = int(now // 60)
             if minute != last_min and now % 60 >= 3:  # 3 s después del cierre de cada vela de 1m
                 last_min = minute
-                for sym in list(st["symbols"]):
-                    for tf in st["tfs"]:
-                        tf_min = TF_MS[tf] // 60_000
-                        if minute % tf_min == 0 or (sym, tf) not in ctx:
-                            try:
-                                process(sym, tf, st, ctx, token, chat)
-                            except Exception as e:
-                                print(f"⚠️ {sym} {tf}: {e}")
+                syms = active_symbols(st)
+                pairs = [(sym, tf) for sym in syms for tf in st["tfs"] if minute % (TF_MS[tf] // 60_000) == 0 or (sym, tf) not in ctx]
+                scan(pairs, st, ctx, token, chat)
+                every = st.get("radar_every", 0)
+                if every and minute % every == 0:  # radar automático a Telegram
+                    try:
+                        send(token, chat, radar_report(st, ctx))
+                    except Exception as e:
+                        print("radar:", e)
                 save_state(st, int(now * 1000))
-                print(time.strftime("%H:%M:%S"), "revisado:", ", ".join(st["symbols"]), "|", ", ".join(st["tfs"]))
+                print(time.strftime("%H:%M:%S"), f"revisado: {len(syms)} monedas", "|", ", ".join(st["tfs"]))
         except KeyboardInterrupt:
             break
         except Exception as e:
