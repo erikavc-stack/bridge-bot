@@ -32,7 +32,8 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          SYMBOLS: "BTCUSDT,ETHUSDT"
+          CLOUD: "1"
+          SYMBOLS: ${{ vars.SYMBOLS || 'BTCUSDT,ETHUSDT' }}   # monedas: Settings → Secrets and variables → Actions → Variables → SYMBOLS
           TIMEFRAMES: "15m,1h"   # GitHub no sirve para 1m-5m: esas las vigila el bot de tu PC
           COMMANDS: "0"          # los comandos (/radar, /winrate...) los contesta el bot de tu PC
           CAPITAL: "2000"
