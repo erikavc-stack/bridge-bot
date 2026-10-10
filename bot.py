@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.0 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.1 (misma lógica que el indicador Bridge Táctico v8)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -679,9 +679,14 @@ CLOUD = os.environ.get("CLOUD") == "1"
 
 def load_state():
     st = {"sent": [], "init": False}
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, encoding="utf-8") as f:
-            st.update(json.load(f))
+    for path in (STATE_FILE, STATE_FILE + ".bak"):  # si el archivo quedó dañado (PC apagada al guardar), se usa la copia
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    st.update(json.load(f))
+                break
+            except Exception as e:
+                print(f"⚠️ {os.path.basename(path)} dañado ({e}); se usa la copia de seguridad o se empieza de cero")
     st.setdefault("symbols", [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()])
     st.setdefault("tfs", [t.strip() for t in os.environ.get("TIMEFRAMES", "1m,3m,5m,15m,1h").split(",") if t.strip()])
     st.setdefault("capital", float(os.environ.get("CAPITAL", "2000")))
@@ -743,8 +748,17 @@ def save_state(st, now):
     if CLOUD:  # el repositorio es público: no se guardan datos de usuarios
         data.pop("users", None)
         data.pop("pending", None)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    tmp = STATE_FILE + ".tmp"
+    try:  # guardado seguro: primero un archivo temporal y luego se reemplaza (nunca queda vacío a medias)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        if os.path.exists(STATE_FILE) and os.path.getsize(STATE_FILE) > 0:
+            os.replace(STATE_FILE, STATE_FILE + ".bak")
+        os.replace(tmp, STATE_FILE)
+    except Exception as e:
+        print("⚠️ no se pudo guardar el estado:", e)
 
 
 def scan_tfs(st):
