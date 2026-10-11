@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.7 (misma lógica que el indicador Bridge Táctico v8.3 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d)
+Bridge Táctico → Telegram  ·  v4.8 (misma lógica que el indicador Bridge Táctico v8.4 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -910,6 +910,7 @@ def save_state(st, now):
     if CLOUD:  # el repositorio es público: no se guardan datos de usuarios
         data.pop("users", None)
         data.pop("pending", None)
+        data.pop("journal", None)
     tmp = STATE_FILE + ".tmp"
     try:  # guardado seguro: primero un archivo temporal y luego se reemplaza (nunca queda vacío a medias)
         with open(tmp, "w", encoding="utf-8") as f:
@@ -984,6 +985,7 @@ HELP_USER = ("🤖 <b>Bridge Táctico · comandos</b>\n"
              "/riesgo 1 → % de riesgo por operación\n"
              "/maxops 5 → máximo de operaciones abiertas a la vez\n"
              "/winrate → acierto real de cada moneda y temporalidad\n"
+             "/stats → tu diario: resultado, factor, caída máxima, rachas y calendario (/stats 7 · 90 · todo)\n"
              "/radar → tendencia de las monedas favoritas\n"
              "/estado → operaciones activas\n"
              "/stop → dejar de recibir señales\n"
@@ -1142,6 +1144,11 @@ def command(token, owner, st, ctx, cid, msg):
         reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
+    elif cmd in ("/stats", "/diario"):
+        a = args[0].lower() if args else ""
+        v = parse_num(args) if args and a not in ("todo", "all", "total") else None
+        days = 0 if a in ("todo", "all", "total") else int(min(max(v, 1), 3650)) if v else 30
+        reply(stats_report(st, uid, days))
     elif cmd == "/estado":
         reply(status_report(st, ctx, uid))
     elif cmd == "/radar" and not (is_owner and args):
@@ -1286,6 +1293,106 @@ def hist_stats(st, pair):
     if not n:
         return {"n": 0, "wr": 0.0, "avg": 0.0}
     return {"n": n, "wr": 100.0 * sum(v[0] for v in h.values()) / n, "avg": sum(v[1] for v in h.values()) / n}
+
+
+# ----------------------------- DIARIO (/stats) -----------------------------
+TZ_H = float(os.environ.get("TZ_HOURS", "-3"))   # hora local del calendario (Brasil = -3; España = 2 en verano)
+JOURNAL_MAX = 3000
+SPARK = "▁▂▃▄▅▆▇█"
+
+
+def journal_add(st, tid, tr, ev, sym, tf, t_close):
+    """Guarda una operación cerrada que llegó a los usuarios. r = resultado en R (1 R = pérdida si toca el SL), con comisiones."""
+    j = st.setdefault("journal", [])
+    j.append({"id": tid, "sym": sym, "tf": tf, "side": ev.get("side", tr.get("side", 0)), "q": ev.get("q", 0), "t": int(t_close),
+              "r": round(float(ev.get("r", 0.0)), 3), "why": ev.get("reason", ""), "to": list(tr.get("to", []))})
+    if len(j) > JOURNAL_MAX:
+        del j[:len(j) - JOURNAL_MAX]
+
+
+def spark(vals, width=24):
+    """Curva de capital en una línea de texto."""
+    if not vals:
+        return ""
+    if len(vals) > width:  # muestreo uniforme (incluye el primero y el último)
+        vals = [vals[round(i * (len(vals) - 1) / (width - 1))] for i in range(width)]
+    lo, hi = min(vals), max(vals)
+    if hi - lo < 1e-9:
+        return SPARK[3] * len(vals)
+    return "".join(SPARK[min(7, int((v - lo) / (hi - lo) * 7 + 0.5))] for v in vals)
+
+
+def stats_report(st, uid="owner", days=30, now=None):
+    """Diario del usuario con las operaciones que recibió y ya se cerraron."""
+    now = now or int(time.time() * 1000)
+    since = now - days * 86_400_000 if days else 0
+    ops = sorted((o for o in st.get("journal", []) if uid in o.get("to", []) and o.get("t", 0) >= since), key=lambda o: o["t"])
+    u = st["users"].get(uid, {})
+    risk = u.get("capital", st["capital"]) * u.get("risk", st["risk"]) / 100
+    head = f"📒 <b>Tu diario</b> · {f'últimos {days} días' if days else 'todo el historial'}"
+    if not ops:
+        return (head + "\nAún no hay operaciones cerradas de las señales que recibiste en este periodo.\n"
+                "(El diario empezó con la v4.8 y se llena solo con cada cierre.)\n/stats 7 · /stats 90 · /stats todo")
+    rs = [o["r"] for o in ops]
+    wins, loss = [r for r in rs if r > 0], [r for r in rs if r <= 0]
+    net, gp, gl = sum(rs), sum(wins), -sum(loss)
+    pf = "∞" if gl <= 0 else f"{gp / gl:.2f}"
+    eq, c, peak, mdd = [0.0], 0.0, 0.0, 0.0
+    for r in rs:
+        c += r
+        eq.append(c)
+        peak = max(peak, c)
+        mdd = max(mdd, peak - c)
+    best_w = best_l = cur = 0
+    for r in rs:
+        cur = (cur + 1 if cur > 0 else 1) if r > 0 else (cur - 1 if cur < 0 else -1)
+        best_w, best_l = max(best_w, cur), min(best_l, cur)
+    usd = lambda r: ("+" if r >= 0 else "−") + f"${abs(r) * risk:,.0f}"
+    lines = [head,
+             f"Operaciones: <b>{len(rs)}</b> · ✅ {len(wins)} · ❌ {len(loss)} · acierto <b>{100 * len(wins) / len(rs):.0f}%</b>",
+             f"Resultado: <b>{net:+.2f} R</b> ≈ {usd(net)} (con tu riesgo de ${risk:,.0f} por operación)",
+             f"Factor: <b>{pf}</b> · R medio {net / len(rs):+.2f} · mejor {max(rs):+.2f} R · peor {min(rs):+.2f} R",
+             f"Caída máxima: −{mdd:.2f} R ({usd(-mdd)})",
+             f"Racha actual: {f'🔥 {cur} ganadas' if cur > 0 else f'❄️ {-cur} perdidas'} · mejor {best_w} · peor {-best_l}",
+             f"Curva: {spark(eq)}"]
+    # calendario de los últimos 14 días (hora local)
+    off = int(TZ_H * 3_600_000)
+    day = lambda t: (t + off) // 86_400_000
+    today = day(now)
+    by_day = {}
+    for o in ops:
+        by_day[day(o["t"])] = by_day.get(day(o["t"]), 0.0) + o["r"]
+    cells = []
+    for k in range(13, -1, -1):
+        v = by_day.get(today - k)
+        cells.append("⬜" if v is None else "🟩" if v > 0.05 else "🟥" if v < -0.05 else "🟨")
+    lines += ["", "📅 <b>Últimos 14 días</b> (🟩 gana · 🟥 pierde · 🟨 ~0 · ⬜ sin cierres)", "".join(cells[:7]) + "  " + "".join(cells[7:])]
+    wd = ("lu", "ma", "mi", "ju", "vi", "sá", "do")   # el día 0 (1-1-1970) fue jueves
+    recent = [(k, by_day[k]) for k in sorted(by_day) if k > today - 7]
+    if recent:
+        lines.append(" · ".join(f"{wd[(k + 3) % 7]} {time.gmtime(k * 86400).tm_mday}: {v:+.1f}R" for k, v in recent))
+
+    def group(key):
+        g = {}
+        for o in ops:
+            a = g.setdefault(o.get(key, "?"), [0, 0.0, 0])
+            a[0] += 1
+            a[1] += o["r"]
+            a[2] += 1 if o["r"] > 0 else 0
+        return g
+    g_tf = sorted(group("tf").items(), key=lambda x: TF_MS.get(x[0], 0))
+    lines += ["", "⏱ <b>Por temporalidad</b> (R · operaciones · acierto)",
+              " · ".join(f"{tf} {a[1]:+.1f}R ({a[0]}, {100 * a[2] / a[0]:.0f}%)" for tf, a in g_tf)]
+    g_sym = sorted(group("sym").items(), key=lambda x: x[1][1], reverse=True)
+    best = " · ".join(f"{coin(s)} {a[1]:+.1f}R" for s, a in g_sym[:3] if a[1] > 0)
+    worst = " · ".join(f"{coin(s)} {a[1]:+.1f}R" for s, a in g_sym[::-1][:3] if a[1] < 0)
+    if best:
+        lines.append("🏅 Mejores: " + best)
+    if worst:
+        lines.append("⚠️ Peores: " + worst)
+    lines.append("\nR = resultado en riesgos (1 R = lo que pierdes si toca el SL), comisiones incluidas.\n/stats 7 · /stats 90 · /stats todo")
+    out = "\n".join(lines)
+    return out if len(out) < 4000 else out[:3900] + "\n…"
 
 
 # Tendencial de cualquier temporalidad (última vela cerrada), con caché por vela
@@ -1482,6 +1589,9 @@ def apply(res, st, ctx, token, owner, notify=True):
             if ev["kind"] in ("CANCEL", "CLOSE"):
                 live.pop(tid, None)
                 tr["closed"] = True  # cerrada aunque el mensaje falle: no bloquea la señal nueva de la misma vela
+            if ev["kind"] == "CLOSE" and not tr.get("j"):
+                journal_add(st, tid, tr, ev, sym, tf, d[ev["bar"]]["ct"])  # v4.8: diario (/stats), una sola vez por operación
+                tr["j"] = True
             rcpt = [u for u in tr["to"] if u in st["users"]]
             got = deliver(token, owner, st, rcpt, sym, tf, ev)
             if rcpt and not got:
