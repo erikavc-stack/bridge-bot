@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.9 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v4.9.1 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -685,9 +685,13 @@ def message(sym, tf, ev, extra=None, scale=1.0):
             lines.append("₿ BTC: " + " · ".join(f"{t} {'▲' if u else '▼'}" for t, u in extra["btc"]))
         qline = f"└── E2: {q2} · E3: {q3} {coin(sym)}" if lim else f"└── E1: {q1} · E2: {q2} · E3: {q3} {coin(sym)}"
         lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk'] * scale:,.0f}):", qline]
+        n_open = extra.get("open_n", 0) + 1
         if extra.get("max_ops"):
-            n_open = extra.get("open_n", 0) + 1
             lines.append(f"🧯 Operaciones abiertas con esta: {n_open}/{extra['max_ops']} · riesgo total ${ev['risk'] * scale * n_open:,.0f}")
+        elif "open_n" in extra:
+            lines.append(f"🧯 Operaciones abiertas con esta: {n_open} · riesgo total ${ev['risk'] * scale * n_open:,.0f}")
+        if extra.get("same"):
+            lines.append(f"⚠️ Ya tienes {coin(sym)} abierta en {', '.join(extra['same'])}: en Bitunix es una sola posición por moneda (se suman)")
         lines += ["", "⚓ <b>ESTRATEGIA:</b>"]
         be_line = ["├── 🔒 Al tocar TP1: SL a la entrada y cancela E2/E3 pendientes (te aviso)"] if tf in BE_TFS else []
         if lim:
@@ -826,7 +830,7 @@ def parse_num(args, amount=False):
 
 # ----------------------------- ESTADO -----------------------------
 CLOUD = os.environ.get("CLOUD") == "1"
-MAX_OPS = int(os.environ.get("MAX_OPS", "5"))   # operaciones abiertas a la vez por usuario (se cambia con /maxops)
+MAX_OPS = int(os.environ.get("MAX_OPS", "0"))   # máximo de operaciones abiertas por usuario (0 = sin límite, v4.9.1; /maxops)
 _st_lock = threading.Lock()
 
 
@@ -877,6 +881,11 @@ def load_state():
     st.setdefault("users", {"owner": {"name": "Admin", "tfs": list(DEFAULT_TFS)}})
     st.setdefault("removed", [])   # monedas quitadas con /quitar (favoritos.txt no las vuelve a poner)
     st.setdefault("max_ops", MAX_OPS)
+    if not st.get("v491"):  # v4.9.1: se envían TODAS las señales (el usuario decide); el límite queda opcional con /maxops
+        st["max_ops"] = 0
+        for u in st.get("users", {}).values():
+            u.pop("max_ops", None)
+        st["v491"] = True
     if not st.get("v46"):  # v4.6: control de operaciones abiertas → las anteriores (sin vigilancia al minuto) cuentan como cerradas
         for p in list(st.get("hist", {})):  # 15m y 4h cambian de regla (SL a la entrada tras TP1): winrate nuevo
             if p.endswith(("_15m", "_4h")):
@@ -1000,7 +1009,7 @@ def settings_line(st, uid="owner"):
     cap, rk = u.get("capital", st["capital"]), u.get("risk", st["risk"])
     mx = max_ops_of(st, uid)
     line = (f"💰 ${cap:,.0f} · riesgo {rk:g}% = ${cap * rk / 100:,.2f} por operación\n"
-            f"🧯 Máx. {mx} operaciones abiertas (riesgo total ${cap * rk / 100 * mx:,.0f}) · 1 por moneda\n"
+            + (f"🧯 Máx. {mx} operaciones abiertas (riesgo total ${cap * rk / 100 * mx:,.0f})\n" if mx else "🧯 Recibes todas las señales (sin límite; /maxops 5 para limitar)\n") +
             f"⏱ Tus temporalidades: {', '.join(u.get('tfs', [])) or 'ninguna (pausado)'}\n"
             f"🔥 Confluencias: {'sí' if u.get('conf', True) else 'no'} · ₿ BTC/ETH de cerca: {'sí' if u.get('maj', True) else 'no'}")
     if uid == "owner":
@@ -1014,7 +1023,7 @@ HELP_USER = ("🤖 <b>Bridge Táctico · comandos</b>\n"
              "/config → elige tus temporalidades con botones\n"
              "/capital 500 → tu capital en $ (para calcular cantidades)\n"
              "/riesgo 1 → % de riesgo por operación\n"
-             "/maxops 5 → máximo de operaciones abiertas a la vez\n"
+             "/maxops 5 → limitar a 5 operaciones abiertas (0 = todas, por defecto)\n"
              "/winrate → acierto real de cada moneda y temporalidad\n"
              "/stats → tu diario: resultado, factor, caída máxima, rachas y calendario (/stats 7 · 90 · todo)\n"
              "/radar → tendencia de las monedas favoritas\n"
@@ -1181,7 +1190,7 @@ def command(token, owner, st, ctx, cid, msg):
         reply(settings_line(st, uid))
     elif cmd == "/maxops":
         v = parse_num(args)
-        if v and 1 <= v <= 30:
+        if v is not None and 0 <= v <= 100:
             me["max_ops"] = int(v)
             if is_owner:
                 st["max_ops"] = int(v)
@@ -1754,12 +1763,11 @@ def apply(res, st, ctx, token, owner, notify=True):
                 if tf not in p.get("tfs", []):
                     continue
                 mine = open_trades(st, u, now)
-                if any(s2 == sym for _, s2, _ in mine):
-                    continue  # ya tiene una operación en esta moneda (Bitunix: una posición por moneda)
-                if len(mine) >= max_ops_of(st, u):
-                    continue  # ya tiene el máximo de operaciones abiertas
-                uids.append(u)
-                per_user[u] = {"open_n": len(mine), "max_ops": max_ops_of(st, u)}
+                mx = max_ops_of(st, u)
+                if mx and len(mine) >= mx:
+                    continue  # el usuario puso un máximo con /maxops y ya lo alcanzó
+                uids.append(u)  # v4.9.1: llegan todas; si ya tiene esa moneda abierta, el mensaje lo avisa
+                per_user[u] = {"open_n": len(mine), "max_ops": mx, "same": [t2 for _, s2, t2 in mine if s2 == sym]}
             extra = {"hist": hist_stats(st, pair), "late": int(age // 60_000) if late else 0, "now_px": now_px,
                      "tradfi": bool(kind), "night": stocks_night(kind)}
             extra.update(open_extras(sym, tf, ev, ctx))
