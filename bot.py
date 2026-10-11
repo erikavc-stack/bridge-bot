@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.6 (misma lógica que el indicador Bridge Táctico v8 + SL a la entrada tras TP1 en 15m/4h)
-Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
+Bridge Táctico → Telegram  ·  v4.7 (misma lógica que el indicador Bridge Táctico v8.3 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d)
+Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
 
@@ -48,7 +48,8 @@ MIN_DIST = float(os.environ.get("MIN_DIST", "0.6"))           # % mínimo entre 
 FEE_TAKER = float(os.environ.get("FEE_TAKER", "0.06")) / 100  # E1 a mercado y stop
 FEE_MAKER = float(os.environ.get("FEE_MAKER", "0.02")) / 100  # E2/E3 y TP con orden límite
 
-TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000}
+TF_MS = {"1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000, "2h": 7_200_000,
+         "4h": 14_400_000, "8h": 28_800_000, "1d": 86_400_000}
 H4_MS = 14_400_000
 BASE = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE, "state.json")
@@ -393,16 +394,17 @@ def dir4_series(sym, d):
 
 # ----------------------------- MODO DE CADA TEMPORALIDAD (igual que el indicador v8 en modo automático) -----------------------------
 LIM_W = (0.0, 0.40, 0.60)   # modo límite: sin entrada a mercado · orden límite en E2 (40 %) y E3 (60 %)
-BE_TFS = tuple(t for t in os.environ.get("BE_TFS", "15m,4h").split(",") if t)   # temporalidades con SL a la entrada tras TP1
-ALL_TFS = ("1m", "3m", "5m", "15m", "1h", "4h")
-DEFAULT_TFS = ["5m", "15m", "1h", "4h"]
+BE_TFS = tuple(t for t in os.environ.get("BE_TFS", "15m,4h,1d").split(",") if t)   # temporalidades con SL a la entrada tras TP1
+ALL_TFS = ("1m", "3m", "5m", "15m", "1h", "2h", "4h", "8h", "1d")
+DEFAULT_TFS = ["15m", "2h", "4h", "8h"]   # las de mejor resultado en la auditoría v4.7 (para amigos nuevos)
 
 
 def tf_mode(tf, st):
     """Auditoría v3.6 (24 monedas, comisiones de Bitunix):
     5m  → límite + a favor de la Tendencial de 15m (+0.20 R/op) · 4h → límite (+0.23 R/op)
     1m/3m → modo preciso (a favor de 15m y 4h, DCA 10/30/60) · 15m/1h → DCA 20/30/50 a mercado."""
-    be = tf in BE_TFS  # v4.6: SL a la entrada tras TP1 (backtest: 15m PF 0.96→1.07, 4h 1.04→1.10; en 1h empeora)
+    be = tf in BE_TFS  # SL a la entrada tras TP1 (backtest v4.6/4.7: mejora 15m, 4h y 1d; en 1h, 2h y 8h empeora)
+    # v4.7: 2h y 8h → DCA 20/30/50 a mercado (backtest 48 monedas: factor 2h 1.06 · 8h 1.42); 1d → DCA + SL a la entrada
     if st.get("limit", True) and tf in ("5m", "4h"):
         return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=["15m"] if tf == "5m" else [], be=be)
     if st.get("h4", True) and TF_MS.get(tf, 0) <= 300_000:
@@ -580,7 +582,8 @@ def send(token, chat_id, text, buttons=None, silent=False):
 
 
 def chart_url(sym, tf):
-    tv = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240"}.get(tf, "15")
+    tv = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "8h": "480",
+          "1d": "D"}.get(tf, "15")
     ex = "" if sym in _bitunix_syms else "BINANCE%3A"
     return f"https://www.tradingview.com/chart/?symbol={ex}{sym}.P&interval={tv}"
 
@@ -891,10 +894,17 @@ def load_state():
     return st
 
 
+def keep_ms(tf):
+    """Cuánto tiempo se recuerda una señal: 7 días, o 120 velas en 8h/1d (esas operaciones duran semanas)."""
+    return max(7 * 86_400_000, 120 * TF_MS.get(tf, 0))
+
+
 def save_state(st, now):
-    cutoff = now - 7 * 86_400_000
-    st["sent"] = sorted(k for k in set(st["sent"]) if int(k.split("_")[-2]) >= cutoff)
-    st["trades"] = {k: v for k, v in st.get("trades", {}).items() if v.get("t", 0) >= cutoff}
+    def keep(k, t):
+        parts = k.split("_")
+        return t >= now - keep_ms(parts[1] if len(parts) > 2 else "")
+    st["sent"] = sorted(k for k in set(st["sent"]) if keep(k, int(k.split("_")[-2])))
+    st["trades"] = {k: v for k, v in st.get("trades", {}).items() if keep(k, v.get("t", 0))}
     with _st_lock:  # el latido (otro hilo) también escribe en el estado
         data = dict(st)
     if CLOUD:  # el repositorio es público: no se guardan datos de usuarios
@@ -993,13 +1003,15 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
 def config_rows(u):
     mark = lambda t: ("✅ " if t in u.get("tfs", []) else "▫️ ") + t
     return [[(mark(t), "tf:" + t) for t in ("1m", "3m", "5m")],
-            [(mark(t), "tf:" + t) for t in ("15m", "1h", "4h")],
+            [(mark(t), "tf:" + t) for t in ("15m", "1h", "2h")],
+            [(mark(t), "tf:" + t) for t in ("4h", "8h", "1d")],
             [("✔️ Listo", "cfg:done")]]
 
 
 CONFIG_TXT = ("⚙️ <b>Tus avisos</b>\nToca una temporalidad para activarla ✅ o quitarla ▫️.\n"
-              "Mejor resultado en la auditoría v4.6 (datos reales, con comisiones): <b>15m</b> y <b>4h</b>.\n"
-              "1m, 3m y 5m dan más señales pero hoy pierden un poco: úsalas con riesgo bajo.")
+              "Auditoría v4.7 (48 monedas, datos reales, con comisiones · factor &gt; 1 = gana):\n"
+              "🥇 <b>8h</b> 1.42 · <b>2h</b> 1.06 · <b>4h</b> 1.02 · <b>15m</b> 1.01 · 1h 0.98\n"
+              "⚠️ 1d 0.86 · 1m 0.93 · 3m 0.72 · 5m 0.73: pierden, úsalas con riesgo bajo.")
 
 
 def send_config(token, chat_id, u):
@@ -1292,7 +1304,7 @@ def tf_state(sym, tf):
 
 def open_extras(sym, tf, ev, ctx):
     dirs, cands = [], []
-    for t in ("1m", "3m", "5m", "15m", "1h", "4h"):
+    for t in ALL_TFS:
         try:
             if (sym, t) in ctx:
                 up, lvl = ctx[(sym, t)]["up"], ctx[(sym, t)]["st"]
