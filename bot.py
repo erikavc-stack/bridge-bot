@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.8 (misma lógica que el indicador Bridge Táctico v8.4 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats)
+Bridge Táctico → Telegram  ·  v4.9 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -397,6 +398,14 @@ LIM_W = (0.0, 0.40, 0.60)   # modo límite: sin entrada a mercado · orden lími
 BE_TFS = tuple(t for t in os.environ.get("BE_TFS", "15m,4h,1d").split(",") if t)   # temporalidades con SL a la entrada tras TP1
 ALL_TFS = ("1m", "3m", "5m", "15m", "1h", "2h", "4h", "8h", "1d")
 DEFAULT_TFS = ["15m", "2h", "4h", "8h"]   # las de mejor resultado en la auditoría v4.7 (para amigos nuevos)
+# v4.9 · CONFLUENCIAS: la misma moneda con LONG (o SHORT) activo en varias temporalidades a la vez.
+# Backtest 50 monedas (con comisiones): las señales que salen con 2+ temporalidades MÁS ya activas del mismo lado
+# ganaron más que el total (factor 1.22 vs 0.94 en 47 días con 15m-1d · 1.10 vs 1.03 en 174 días con 1h-1d).
+CONF_TFS = tuple(t for t in os.environ.get("CONF_TFS", "3m,5m,15m,1h,2h,4h,8h,1d").split(",") if t in TF_MS)
+CONF_MIN = int(os.environ.get("CONF_MIN", "3"))   # temporalidades con señal activa del mismo lado para avisar
+CONF_COOL = 4 * 3_600_000                          # el mismo aviso no se repite antes de 4 h (salvo que sumen más temporalidades)
+MAJORS = ("BTCUSDT", "ETHUSDT")                   # se siguen de cerca: todas las temporalidades, aviso desde 2 y cambios de tendencia
+MAJ_FLIP_TFS = ("1h", "4h", "1d")
 
 
 def tf_mode(tf, st):
@@ -670,6 +679,10 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         tgt = extra.get("htf_tp")
         if tgt:
             lines.append(f"🧲 Tendencial {tgt[0]}: {money(tgt[1])} ({pct(tgt[1])})")
+        if extra.get("conf"):
+            lines.append(f"🔥 <b>Confluencia</b>: {s} activo también en {' · '.join(extra['conf'])} ({len(extra['conf']) + 1} temporalidades)")
+        if extra.get("btc"):
+            lines.append("₿ BTC: " + " · ".join(f"{t} {'▲' if u else '▼'}" for t, u in extra["btc"]))
         qline = f"└── E2: {q2} · E3: {q3} {coin(sym)}" if lim else f"└── E1: {q1} · E2: {q2} · E3: {q3} {coin(sym)}"
         lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk'] * scale:,.0f}):", qline]
         if extra.get("max_ops"):
@@ -932,6 +945,23 @@ def scan_tfs(st):
     return [t for t in ALL_TFS if t in want]
 
 
+def conf_symbols(st):
+    """Monedas para las confluencias: BTC y ETH siempre (si alguien los sigue) + las favoritas (si alguien quiere confluencias)."""
+    if CLOUD:
+        return []
+    us = list(st["users"].values())
+    out = list(MAJORS) if any(u.get("maj", True) or u.get("conf", True) for u in us) else []
+    if any(u.get("conf", True) for u in us):
+        out += [s for s in st["symbols"] if s not in out]
+    return out
+
+
+def all_pairs(st):
+    """Gráficos a revisar: las temporalidades elegidas por los usuarios + todas las de confluencia en favoritas, BTC y ETH."""
+    base = [(s, t) for s in active_symbols(st) for t in scan_tfs(st)]
+    return list(dict.fromkeys(base + [(s, t) for s in conf_symbols(st) for t in CONF_TFS]))
+
+
 def chat_of(uid, owner):
     return owner if uid == "owner" else uid
 
@@ -971,7 +1001,8 @@ def settings_line(st, uid="owner"):
     mx = max_ops_of(st, uid)
     line = (f"💰 ${cap:,.0f} · riesgo {rk:g}% = ${cap * rk / 100:,.2f} por operación\n"
             f"🧯 Máx. {mx} operaciones abiertas (riesgo total ${cap * rk / 100 * mx:,.0f}) · 1 por moneda\n"
-            f"⏱ Tus temporalidades: {', '.join(u.get('tfs', [])) or 'ninguna (pausado)'}")
+            f"⏱ Tus temporalidades: {', '.join(u.get('tfs', [])) or 'ninguna (pausado)'}\n"
+            f"🔥 Confluencias: {'sí' if u.get('conf', True) else 'no'} · ₿ BTC/ETH de cerca: {'sí' if u.get('maj', True) else 'no'}")
     if uid == "owner":
         line += (f"\n🛡 SL mínimo {MIN_DIST:g}% · 📥 modo límite 5m/4h: {'sí' if st.get('limit', True) else 'no'}"
                  f" · 🎯 modo preciso 1m/3m: {'sí' if st['h4'] else 'no'} · monedas: favoritas + top {st.get('top', 0)}")
@@ -987,6 +1018,7 @@ HELP_USER = ("🤖 <b>Bridge Táctico · comandos</b>\n"
              "/winrate → acierto real de cada moneda y temporalidad\n"
              "/stats → tu diario: resultado, factor, caída máxima, rachas y calendario (/stats 7 · 90 · todo)\n"
              "/radar → tendencia de las monedas favoritas\n"
+             "/btc → BTC y ETH de cerca: tendencia y señales en cada temporalidad\n"
              "/estado → operaciones activas\n"
              "/stop → dejar de recibir señales\n"
              "/ayuda → este mensaje")
@@ -1007,10 +1039,14 @@ def config_rows(u):
     return [[(mark(t), "tf:" + t) for t in ("1m", "3m", "5m")],
             [(mark(t), "tf:" + t) for t in ("15m", "1h", "2h")],
             [(mark(t), "tf:" + t) for t in ("4h", "8h", "1d")],
+            [(("✅ " if u.get("conf", True) else "▫️ ") + "🔥 Confluencias", "cf:conf"),
+             (("✅ " if u.get("maj", True) else "▫️ ") + "₿ BTC/ETH de cerca", "cf:maj")],
             [("✔️ Listo", "cfg:done")]]
 
 
 CONFIG_TXT = ("⚙️ <b>Tus avisos</b>\nToca una temporalidad para activarla ✅ o quitarla ▫️.\n"
+              "🔥 Confluencias: una moneda con LONG o SHORT activo en 3+ temporalidades (de 3m a 1d) · "
+              "₿ BTC/ETH: aviso desde 2 temporalidades y cuando cambia su tendencia de 1h, 4h o 1d.\n"
               "Auditoría v4.7 (48 monedas, datos reales, con comisiones · factor &gt; 1 = gana):\n"
               "🥇 <b>8h</b> 1.42 · <b>2h</b> 1.06 · <b>4h</b> 1.02 · <b>15m</b> 1.01 · 1h 0.98\n"
               "⚠️ 1d 0.86 · 1m 0.93 · 3m 0.72 · 5m 0.73: pierden, úsalas con riesgo bajo.")
@@ -1053,6 +1089,14 @@ def handle_callback(token, owner, st, cq):
             tfs.append(t)
             note = f"{t} activado"
         st["users"][uid]["tfs"] = [x for x in ALL_TFS if x in tfs]
+        try:
+            tg(token, "editMessageReplyMarkup", {"chat_id": cid, "message_id": mid, "reply_markup": kb(config_rows(st["users"][uid]))})
+        except Exception as e:
+            print("config:", e)
+    elif data.startswith("cf:") and uid in st["users"] and data[3:] in ("conf", "maj"):
+        k = data[3:]
+        st["users"][uid][k] = not st["users"][uid].get(k, True)
+        note = ("Confluencias " if k == "conf" else "BTC/ETH ") + ("activado" if st["users"][uid][k] else "desactivado")
         try:
             tg(token, "editMessageReplyMarkup", {"chat_id": cid, "message_id": mid, "reply_markup": kb(config_rows(st["users"][uid]))})
         except Exception as e:
@@ -1144,6 +1188,8 @@ def command(token, owner, st, ctx, cid, msg):
         reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
+    elif cmd in ("/btc", "/eth"):
+        reply(majors_report(st, ctx))
     elif cmd in ("/stats", "/diario"):
         a = args[0].lower() if args else ""
         v = parse_num(args) if args and a not in ("todo", "all", "total") else None
@@ -1293,6 +1339,147 @@ def hist_stats(st, pair):
     if not n:
         return {"n": 0, "wr": 0.0, "avg": 0.0}
     return {"n": n, "wr": 100.0 * sum(v[0] for v in h.values()) / n, "avg": sum(v[1] for v in h.values()) / n}
+
+
+# ----------------------------- CONFLUENCIAS Y BTC/ETH (v4.9) -----------------------------
+def conf_active(sym, ctx):
+    """Temporalidades con operación activa (✓) de cada lado y cuántas Tendenciales están alcistas."""
+    act, ups, n = {1: [], -1: []}, 0, 0
+    for tf in CONF_TFS:
+        c = ctx.get((sym, tf))
+        if not c:
+            continue
+        n += 1
+        ups += 1 if c["up"] else 0
+        T = c.get("T")
+        if T:
+            act[T["side"]].append(tf)
+    return act, ups, n
+
+
+def dirs_line(sym, ctx, tfs=CONF_TFS):
+    return " ".join(f"{t}{'▲' if ctx[(sym, t)]['up'] else '▼'}" for t in tfs if (sym, t) in ctx)
+
+
+def conf_message(st, ctx, sym, side, tfs, newest, ups, n):
+    s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
+    fav = ups if side == 1 else n - ups
+    c = ctx[(sym, newest)]
+    T = c["T"]
+    pct = lambda x: f"{(x - T['e1']) / T['e1'] * 100:+.2f}%"
+    age = max(0, int((time.time() * 1000 - c["t_open"]) // 60_000))
+    lev = min(T["lev"], TRADFI_MAX_LEV) if tradfi_kind(sym) else T["lev"]
+    lines = [f"🔥 <b>CONFLUENCIA {s}</b> · <a href=\"{chart_url(sym, newest)}\">{sym}.P</a> {icon}", "",
+             f"✓ {s} activo en <b>{len(tfs)} temporalidades</b>: {' · '.join(tfs)}",
+             f"📈 Tendencial a favor en {fav} de {n}: {dirs_line(sym, ctx)}", "",
+             f"🆕 <b>Última señal: {newest} {T['q']}/3</b> (hace {age} min)"]
+    if T["pos"] == 0:
+        lines.append(f"├── 📥 Órdenes límite: E2 {money(T['e2'])} ({pct(T['e2'])}) · E3 {money(T['e3'])} ({pct(T['e3'])})")
+    else:
+        lines.append(f"├── 💰 Entrada {money(T['e1'])} · DCA {money(T['e2'])} / {money(T['e3'])}")
+    lines += [f"├── 🛟 SL {money(T['sl'])} ({pct(T['sl'])})",
+              f"├── 🎯 TP1 {money(T['tps'][0])} · TP2 {money(T['tps'][1])} · TP3 {money(T['tps'][2])}" + (" (TP1 ✓)" if T.get("tp") else ""),
+              f"└── ⚡ {lev}x"]
+    wr = []
+    for t in tfs:
+        h = hist_stats(st, f"{sym}_{t}")
+        wr.append(f"{t} ⚪—" if h["n"] < 5 else f"{t} {wr_dot(h)}{h['wr']:.0f}%")
+    lines.append("🏆 Winrate de esta moneda: " + " · ".join(wr))
+    if sym != "BTCUSDT" and ("BTCUSDT", "1h") in ctx:
+        lines.append("₿ BTC: " + dirs_line("BTCUSDT", ctx, ("15m", "1h", "4h", "1d")))
+    if len(tfs) >= CONF_MIN:
+        lines += ["", "📊 <i>Backtest 50 monedas: las señales con 3 o más temporalidades activas a la vez ganaron más que el resto "
+                      "(factor 1.10-1.22 frente a 0.94-1.03). No es seguro: usa siempre el SL.</i>"]
+    else:
+        lines += ["", f"₿ <i>Vigilancia de {coin(sym)}: aviso desde 2 temporalidades. Con solo 2 el backtest no mostró ventaja clara: "
+                      "tómalo como contexto.</i>"]
+    return "\n".join(lines)
+
+
+def confluence(token, owner, st, ctx, notify=True):
+    """Avisa cuando una moneda suma LONG (o SHORT) activo en varias temporalidades a la vez.
+    Solo si la última señal es reciente (máx. 3 velas) y sin repetir el mismo aviso antes de 4 h."""
+    mem = st.setdefault("conf", {})
+    now = int(time.time() * 1000)
+    for sym in conf_symbols(st):
+        act, ups, n = conf_active(sym, ctx)
+        if n < len(CONF_TFS) - 1:
+            continue  # faltan datos de esta moneda (arranque o fuente caída): no decidir nada
+        major = sym in MAJORS
+        need = 2 if major else CONF_MIN
+        for side in (1, -1):
+            tfs, key = act[side], f"{sym}_{side}"
+            m = mem.setdefault(key, {"n": 0, "sent_n": 0, "sent_t": 0})
+            prev, joined = m["n"], [t for t in tfs if t not in m.get("tfs", [])]
+            m["n"], m["tfs"] = len(tfs), list(tfs)
+            if len(tfs) < need or len(tfs) <= prev:
+                continue
+            fresh = [t for t in joined if ctx[(sym, t)].get("t_open") and now - ctx[(sym, t)]["t_open"] <= 3 * TF_MS[t] + 120_000]
+            if not fresh:
+                continue  # la temporalidad que se sumó trae una señal vieja: no sirve para entrar
+            newest = max(fresh, key=lambda t: ctx[(sym, t)]["t_open"])
+            if len(tfs) <= m["sent_n"] and now - m["sent_t"] < CONF_COOL:
+                continue  # ya se avisó hace poco con las mismas (o más) temporalidades
+            kind = tradfi_kind(sym)
+            if kind and market_closed(kind):
+                continue
+            m["sent_n"], m["sent_t"] = len(tfs), now
+            if not notify:
+                continue
+            rcpt = [u for u, p in st["users"].items()
+                    if (p.get("conf", True) and len(tfs) >= CONF_MIN) or (major and p.get("maj", True))]
+            txt = conf_message(st, ctx, sym, side, tfs, newest, ups, n)
+            ok = 0
+            for uid in rcpt:
+                try:
+                    send(token, chat_of(uid, owner), txt, signal_buttons(sym, newest))
+                    ok += 1
+                except Exception as e:
+                    print("confluencia:", uid, e)
+            print(time.strftime("%H:%M:%S"), "🔥 confluencia", sym, "LONG" if side == 1 else "SHORT", "+".join(tfs), f"→ {ok}")
+
+
+def majors_watch(token, owner, st, ctx, notify=True):
+    """BTC y ETH de cerca: aviso cuando su Tendencial de 1h, 4h o 1d cambia de dirección (contexto de todo el mercado)."""
+    mem = st.setdefault("maj_dir", {})
+    rcpt = [u for u, p in st["users"].items() if p.get("maj", True)]
+    for sym in MAJORS:
+        for tf in MAJ_FLIP_TFS:
+            c = ctx.get((sym, tf))
+            if not c:
+                continue
+            k, up = f"{sym}_{tf}", bool(c["up"])
+            prev, mem[k] = mem.get(k), up
+            if prev is None or prev == up or not notify or CLOUD:
+                continue
+            txt = "\n".join([f"₿ <b>{coin(sym)} {tf}: la Tendencial cambió a {'ALCISTA ▲' if up else 'BAJISTA ▼'}</b>", "",
+                              f"📍 Línea {money(c['st'])} · precio {money(c.get('px') or c['st'])}",
+                              f"📈 {coin(sym)}: {dirs_line(sym, ctx)}", "",
+                              "ℹ️ <i>Contexto del mercado, no es una señal de entrada. Revisa tus operaciones abiertas "
+                              f"{'en SHORT' if up else 'en LONG'}.</i>"])
+            for uid in rcpt:
+                try:
+                    send(token, chat_of(uid, owner), txt, signal_buttons(sym, tf))
+                except Exception as e:
+                    print("btc/eth:", uid, e)
+
+
+def majors_report(st, ctx):
+    lines = ["₿ <b>BTC y ETH de cerca</b>"]
+    for sym in MAJORS:
+        act, ups, n = conf_active(sym, ctx)
+        if not n:
+            lines.append(f"<b>{coin(sym)}</b> … (aún calculando)")
+            continue
+        px = next((ctx[(sym, t)].get("px") for t in CONF_TFS if (sym, t) in ctx), None)
+        lines += ["", f"<b>{coin(sym)}</b> {money(px) if px else ''} · {round(ups / n * 100)}% alcista", dirs_line(sym, ctx)]
+        for side, nm in ((1, "🟢 LONG"), (-1, "🔴 SHORT")):
+            if act[side]:
+                lines.append(f"{nm} activo en: " + " · ".join(f"{t} ({ctx[(sym, t)]['T']['q']}/3)" for t in act[side]))
+        if not act[1] and not act[-1]:
+            lines.append("Sin señales activas.")
+    lines.append("\n▲▼ Tendencial de cada temporalidad (última vela cerrada)")
+    return "\n".join(lines)
 
 
 # ----------------------------- DIARIO (/stats) -----------------------------
@@ -1463,7 +1650,7 @@ _last1m = {}  # moneda -> últimas velas de 1m (para vigilar TP/entradas al minu
 def compute(sym, tf, st):
     """Descarga y calcula una moneda/temporalidad. No toca el estado (se puede ejecutar en paralelo)."""
     pair = f"{sym}_{tf}"
-    d = fetch_klines(sym, tf, 1000)
+    d = fetch_klines(sym, tf, 1000 if tf in scan_tfs(st) else 499)  # solo confluencia: 499 velas (pesa 2 en Binance, no 5)
     if tf == "1m":
         _last1m[sym] = (time.time(), d[-5:])
     I = indicators(d)
@@ -1471,7 +1658,7 @@ def compute(sym, tf, st):
     dirs = [dir_series(sym, d, h) for h in m["htf"]] or None
     events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"])
     seed = None
-    if pair not in st.get("hist_seeded", []):  # la primera vez: winrate con un historial largo
+    if pair not in st.get("hist_seeded", []) and tf in scan_tfs(st):  # la primera vez: winrate con un historial largo
         try:
             dl = fetch_long(sym, tf, 3000)
             dl_dirs = [dir_series(sym, dl, h) for h in m["htf"]] or None
@@ -1509,7 +1696,8 @@ def apply(res, st, ctx, token, owner, notify=True):
     sym, tf, d = res["sym"], res["tf"], res["d"]
     pair = f"{sym}_{tf}"
     T = res["T"]
-    ctx[(sym, tf)] = {"up": res["up"], "st": res["st"], "T": T, "pts": res["pts"]}
+    ctx[(sym, tf)] = {"up": res["up"], "st": res["st"], "T": T, "pts": res["pts"], "px": d[-1]["c"],
+                      "t_open": d[T["bar"]]["ct"] if T else None}
     H = st.setdefault("hist", {}).setdefault(pair, {})
     if res["seed"] is not None:
         for k, w, r in res["seed"]:
@@ -1575,6 +1763,9 @@ def apply(res, st, ctx, token, owner, notify=True):
             extra = {"hist": hist_stats(st, pair), "late": int(age // 60_000) if late else 0, "now_px": now_px,
                      "tradfi": bool(kind), "night": stocks_night(kind)}
             extra.update(open_extras(sym, tf, ev, ctx))
+            extra["conf"] = [t for t in ALL_TFS if t != tf and ((ctx.get((sym, t)) or {}).get("T") or {}).get("side") == ev["side"]]
+            if sym != "BTCUSDT":
+                extra["btc"] = [(t, ctx[("BTCUSDT", t)]["up"]) for t in ("15m", "1h", "4h", "1d") if ("BTCUSDT", t) in ctx]
             to = deliver(token, owner, st, uids, sym, tf, ev, extra, per_user)
             if uids and not to:
                 sent.discard(key)  # no llegó a nadie (sin internet): se reintenta en la próxima vuelta
@@ -1777,7 +1968,7 @@ def weekend_warn(token, owner, st):
 
 def start_up(token, chat, st, ctx):
     """Primera revisión completa al arrancar (o al tomar el control)."""
-    n_pairs = len(active_symbols(st)) * len(scan_tfs(st))
+    n_pairs = len(all_pairs(st))
     nuevos = sum(1 for s in active_symbols(st) for t in scan_tfs(st) if f"{s}_{t}" not in st.get("hist_seeded", []))
     print(f"Revisando {n_pairs} gráficos" + (f" ({nuevos} calculan su winrate por primera vez: tarda unos minutos)" if nuevos else ""))
     try:
@@ -1787,6 +1978,8 @@ def start_up(token, chat, st, ctx):
         print("telegram:", e)
     heartbeat(token, chat, st, force=True, fresh=True)  # avisa enseguida que este equipo tomó el control
     run_once(token, chat, st, ctx, progress=True)
+    confluence(token, chat, st, ctx, notify=False)   # lo que ya estaba armado al arrancar no se avisa de nuevo
+    majors_watch(token, chat, st, ctx, notify=False)
     heartbeat(token, chat, st, force=True)
     try:
         send(token, chat, f"🤖 <b>Bridge Táctico v4 activo [{HOST}]</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
@@ -1834,7 +2027,7 @@ def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
 
 
 def run_once(token, owner, st, ctx, notify=True, progress=False):
-    scan([(s, t) for s in active_symbols(st) for t in scan_tfs(st)], st, ctx, token, owner, notify, progress)
+    scan(all_pairs(st), st, ctx, token, owner, notify, progress)
 
 
 def main():
@@ -1904,7 +2097,7 @@ def main():
                     syms = active_symbols(st)
                     tfs = scan_tfs(st)
                     due = {tf for tf in ALL_TFS if done.get(tf) != minute // (TF_MS[tf] // 60_000)}
-                    pairs = [(sym, tf) for sym in syms for tf in tfs if tf in due or (sym, tf) not in ctx]
+                    pairs = [(s, t) for s, t in all_pairs(st) if t in due or (s, t) not in ctx]
                     for tid, tr in st.get("trades", {}).items():  # operaciones abiertas: se siguen aunque la moneda ya no esté en la lista
                         if not (tr.get("closed") or tr.get("cancelled")):
                             s2, t2, _ = tid.rsplit("_", 2)
@@ -1915,6 +2108,8 @@ def main():
                     for tf in due:
                         done[tf] = minute // (TF_MS[tf] // 60_000)
                     live_watch(token, chat, st)
+                    confluence(token, chat, st, ctx)
+                    majors_watch(token, chat, st, ctx)
                     weekend_warn(token, chat, st)
                     heartbeat(token, chat, st)
                     every = st.get("radar_every", 0)
