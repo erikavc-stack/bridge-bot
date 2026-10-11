@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.1 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.2 (misma lógica que el indicador Bridge Táctico v8)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -1350,19 +1350,25 @@ def pc_alive(token, owner):
     return pm.get("text", "").startswith("🟢") and time.time() - last < 12 * 60, pm
 
 
-def scan(pairs, st, ctx, token, owner, notify=True):
+def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
     from concurrent.futures import ThreadPoolExecutor
+    t_save = time.time()
     with ThreadPoolExecutor(max_workers=8) as ex:
         futs = [(sym, tf, ex.submit(compute, sym, tf, st)) for sym, tf in pairs]
-        for sym, tf, f in futs:
+        for n, (sym, tf, f) in enumerate(futs, 1):
             try:
                 apply(f.result(), st, ctx, token, owner, notify)
             except Exception as e:
                 print(f"⚠️ {sym} {tf}: {e}")
+            if progress and (n % 20 == 0 or n == len(futs)):
+                print(time.strftime("%H:%M:%S"), f"preparando: {n}/{len(futs)} gráficos")
+            if progress and time.time() - t_save > 60:  # la primera vez tarda: se guarda el avance cada minuto
+                save_state(st, int(time.time() * 1000))
+                t_save = time.time()
 
 
-def run_once(token, owner, st, ctx, notify=True):
-    scan([(s, t) for s in active_symbols(st) for t in scan_tfs(st)], st, ctx, token, owner, notify)
+def run_once(token, owner, st, ctx, notify=True, progress=False):
+    scan([(s, t) for s in active_symbols(st) for t in scan_tfs(st)], st, ctx, token, owner, notify, progress)
 
 
 def main():
@@ -1394,11 +1400,22 @@ def main():
         return
 
     print("Bridge Táctico bot en marcha (cierra la ventana o Ctrl+C para detener)…")
-    run_once(token, chat, st, ctx)
+    n_pairs = len(active_symbols(st)) * len(scan_tfs(st))
+    nuevos = sum(1 for s in active_symbols(st) for t in scan_tfs(st) if f"{s}_{t}" not in st.get("hist_seeded", []))
+    print(f"Revisando {n_pairs} gráficos" + (f" ({nuevos} calculan su winrate por primera vez: tarda unos minutos)" if nuevos else ""))
+    try:
+        send(token, chat, f"⏳ <b>Bot iniciando</b>: revisando {n_pairs} gráficos" +
+             (f" ({nuevos} calculan su winrate por primera vez, tarda unos minutos)." if nuevos else "."), silent=True)
+    except Exception as e:
+        print("telegram:", e)
+    run_once(token, chat, st, ctx, progress=True)
     heartbeat(token, chat, st, force=True)
-    send(token, chat, f"🤖 <b>Bridge Táctico v4 activo</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
-                      "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) +
-                      "\n\n/config → elegir temporalidades · /ayuda → comandos", silent=True)
+    try:
+        send(token, chat, f"🤖 <b>Bridge Táctico v4 activo</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
+                          "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) +
+                          "\n\n/config → elegir temporalidades · /ayuda → comandos", silent=True)
+    except Exception as e:
+        print("telegram:", e)
     st["init"] = True
     save_state(st, int(time.time() * 1000))
     last_min = None
