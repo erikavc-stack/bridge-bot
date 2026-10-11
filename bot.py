@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.2 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.3 (misma lógica que el indicador Bridge Táctico v8)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -125,17 +125,28 @@ def fetch_bitunix(symbol, tf, total):
         if j.get("code") != 0:
             raise RuntimeError(f"Bitunix: {j.get('msg')}")
         rows = j.get("data") or []
+        before = len(got)
         for r in rows:
             t = int(r["time"])
             got[t] = dict(t=t, o=float(r["open"]), h=float(r["high"]), l=float(r["low"]), c=float(r["close"]),
                           v=float(r.get("baseVol") or 0), ct=t + ms - 1)
-        if len(rows) < 200:
+        if len(rows) < 200 or len(got) == before:  # última página (o la API repite la misma): terminar
             break
         end = min(int(r["time"]) for r in rows)
         time.sleep(0.15)
     if got:
         _bitunix_syms.add(symbol)
     return [got[t] for t in sorted(got) if got[t]["ct"] < now][-total:]
+
+
+def bad_data(bars, tf):
+    """Datos inservibles: moneda suspendida en esa fuente (velas planas, siempre el mismo precio) o sin velas recientes."""
+    if not bars:
+        return True
+    if bars[-1]["ct"] < int(time.time() * 1000) - 3 * TF_MS.get(tf, 60_000) - 120_000:
+        return True
+    tail = bars[-50:]
+    return len(tail) >= 10 and sum(1 for b in tail if b["h"] == b["l"]) >= 0.8 * len(tail)
 
 
 def fetch_klines(symbol, tf, limit=600):
@@ -146,7 +157,11 @@ def fetch_klines(symbol, tf, limit=600):
             rows = http_get(f"{base}?{q}")
             bars = [dict(t=int(k[0]), o=float(k[1]), h=float(k[2]), l=float(k[3]), c=float(k[4]), v=float(k[5]), ct=int(k[6])) for k in rows]
             now = int(time.time() * 1000)
-            return [b for b in bars if b["ct"] < now]  # solo velas cerradas
+            bars = [b for b in bars if b["ct"] < now]  # solo velas cerradas
+            if bad_data(bars, tf):
+                _bad_src.add((_host(base), symbol))  # esta fuente tiene la moneda suspendida: usar la siguiente
+                raise RuntimeError(f"{symbol} sin datos válidos en {_host(base)}")
+            return bars
         except Exception as e:  # probar la siguiente fuente
             _mark_bad(base, symbol, e)
             last = e
@@ -187,7 +202,11 @@ def _fetch_long(base, symbol, tf, total):
         end = bars[0]["t"] - 1
         time.sleep(0.3)
     now = int(time.time() * 1000)
-    return [b for b in out if b["ct"] < now]
+    out = [b for b in out if b["ct"] < now]
+    if bad_data(out, tf):
+        _bad_src.add((_host(base), symbol))
+        raise RuntimeError(f"{symbol} sin datos válidos en {_host(base)}")
+    return out
 
 
 # ----------------------------- INDICADORES -----------------------------
@@ -353,7 +372,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
             last_xup = i
         if wt1[i] < wt2[i] and wt1[i - 1] >= wt2[i - 1] and max(wt1[i], wt1[i - 1]) >= WT_LVL:
             last_xdn = i
-        z = (b["l"] - st[i]) / atr[i] if up else (st[i] - b["h"]) / atr[i]
+        z = ((b["l"] - st[i]) / atr[i] if up else (st[i] - b["h"]) / atr[i]) if atr[i] else float("inf")
         if z <= ZONE_ATR and (b["c"] > st[i] if up else b["c"] < st[i]):
             if i - last_zone > TOUCH_WIN:
                 fired = False
