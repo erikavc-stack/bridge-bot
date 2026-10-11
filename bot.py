@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.5 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.6 (misma lógica que el indicador Bridge Táctico v8 + SL a la entrada tras TP1 en 15m/4h)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -15,7 +15,7 @@ Modos:
   python bot.py --loop   → corre sin parar en tu PC (señales al instante, todas las temporalidades)
   python bot.py          → una sola pasada (GitHub Actions: respaldo 15m/1h/4h cuando la PC está apagada)
 """
-import json, os, re, sys, time, threading, socket
+import json, os, re, sys, time, threading, socket, signal, html
 import urllib.request, urllib.parse, urllib.error
 
 try:
@@ -56,7 +56,7 @@ CONFIG_FILE = os.path.join(BASE, "config.json")
 SOURCES = ["https://fapi.binance.com/fapi/v1/klines", "https://data-api.binance.vision/api/v3/klines", "https://api.binance.com/api/v3/klines"]
 BITUNIX = "https://fapi.bitunix.com/api/v1/futures/market/kline"  # respaldo: monedas que no están en Binance (OKB, RAY...)
 _bitunix_syms = set()   # monedas cuyos precios vienen de Bitunix (para el enlace del gráfico)
-_bad_src = set()        # (fuente, moneda) que Binance dijo que NO existe → no volver a preguntar
+_bad_src = {}           # (fuente, moneda) -> hasta cuándo no usarla (no existe allí o datos viejos/planos)
 PLACEHOLDERS = ("", "PEGA_AQUI_TU_TOKEN", "PEGA_AQUI_TU_CHAT_ID")
 
 
@@ -76,14 +76,70 @@ def _cool(url, secs):
 
 def usable_sources(symbol=None):
     now = time.time()
-    ok = [b for b in SOURCES if (_host(b), symbol) not in _bad_src]
+    ok = [b for b in SOURCES if _bad_src.get((_host(b), symbol), 0) <= now]
     return [b for b in ok if _cool_until.get(_host(b), 0) <= now] or ok[-1:]
 
 
+def _set_bad(base, symbol, secs):
+    _bad_src[(_host(base), symbol)] = time.time() + secs
+
+
 def _mark_bad(base, symbol, e):
-    """Binance responde 400 cuando la moneda no existe en esa fuente: se recuerda para no perder tiempo."""
+    """Binance responde 400 cuando la moneda no existe en esa fuente: se recuerda 6 h para no perder tiempo."""
     if isinstance(e, urllib.error.HTTPError) and e.code == 400:
-        _bad_src.add((_host(base), symbol))
+        _set_bad(base, symbol, 6 * 3600)
+
+
+# ----------------------------- ACTIVOS TRADICIONALES (oro, plata, petróleo, acciones) -----------------------------
+TRADFI_MAX_LEV = int(os.environ.get("TRADFI_MAX_LEV", "10"))
+_COMMODITY_BASES = {"XAU", "XAG", "XPT", "XPD", "CL", "BZ", "NATGAS", "COPPER"}
+_EQUITY_BASES = {"SPCX", "CRCL", "TSLA", "NVDA", "AAPL", "MSTR", "COIN", "HOOD", "AMZN", "META", "GOOGL", "MSFT", "PLTR",
+                 "AMD", "INTC", "ORCL", "TSM", "AVGO", "SPY", "QQQ"}   # respaldo si Binance no responde (p. ej. desde EE. UU.)
+_tradfi = {"t": 0, "map": {}}   # moneda -> "COMMODITY" / "EQUITY" / ... según Binance
+_tradfi_lock = threading.Lock()
+
+
+def tradfi_kind(sym):
+    """None si es cripto; si no, el tipo de activo tradicional (se consulta a Binance una vez al día)."""
+    if time.time() - _tradfi["t"] > 86_400 and _tradfi_lock.acquire(blocking=False):  # un solo hilo consulta
+        try:
+            _tradfi["t"] = time.time()
+            info = http_get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=30)
+            _tradfi["map"] = {s["symbol"]: s.get("underlyingType") or "TRADFI" for s in info.get("symbols", [])
+                              if s.get("contractType") == "TRADIFI_PERPETUAL"}
+        except Exception as e:
+            print("exchangeInfo:", e)
+            _tradfi["t"] = time.time() - 86_400 + 600  # reintentar en 10 min
+        finally:
+            _tradfi_lock.release()
+    k = _tradfi["map"].get(sym)
+    if k:
+        return k
+    base = sym[:-4] if sym.endswith("USDT") else sym
+    return "COMMODITY" if base in _COMMODITY_BASES else "EQUITY" if base in _EQUITY_BASES else None
+
+
+def market_closed(kind, t=None):
+    """Horario del mercado REAL detrás del contrato (en UTC, con margen por el horario de verano).
+    Devuelve el motivo si no conviene abrir una operación nueva ahora, o "" si se puede."""
+    g = time.gmtime(t if t is not None else time.time())
+    wd, h = g.tm_wday, g.tm_hour + g.tm_min / 60   # lunes = 0 … domingo = 6
+    if (wd == 4 and h >= 18) or wd == 5 or (wd == 6 and h < 23):
+        return "cierre de fin de semana"
+    if kind and kind != "COMMODITY" and wd == 6:
+        return "cierre de fin de semana"
+    if kind and kind != "COMMODITY" and wd == 0 and h < 14.5:
+        return "bolsa de EE. UU. cerrada hasta el lunes 13:30–14:30 UTC"
+    return ""
+
+
+def stocks_night(kind, t=None):
+    """Acciones fuera del horario de la bolsa de EE. UU. (el precio puede saltar en la apertura)."""
+    if not kind or kind == "COMMODITY":
+        return False
+    g = time.gmtime(t if t is not None else time.time())
+    h = g.tm_hour + g.tm_min / 60
+    return not (13.5 <= h < 21)
 
 
 def http_get(url, timeout=20):
@@ -139,12 +195,15 @@ def fetch_bitunix(symbol, tf, total):
     return [got[t] for t in sorted(got) if got[t]["ct"] < now][-total:]
 
 
-def bad_data(bars, tf):
-    """Datos inservibles: moneda suspendida en esa fuente (velas planas, siempre el mismo precio) o sin velas recientes."""
+def bad_data(bars, tf, sym=None):
+    """Datos inservibles: moneda suspendida en esa fuente (velas planas, siempre el mismo precio) o sin velas recientes.
+    En oro/acciones las velas planas son normales con el mercado real cerrado: ahí solo se mira que haya velas recientes."""
     if not bars:
         return True
     if bars[-1]["ct"] < int(time.time() * 1000) - 3 * TF_MS.get(tf, 60_000) - 120_000:
         return True
+    if sym and tradfi_kind(sym):
+        return False
     tail = bars[-50:]
     return len(tail) >= 10 and sum(1 for b in tail if b["h"] == b["l"]) >= 0.8 * len(tail)
 
@@ -158,8 +217,8 @@ def fetch_klines(symbol, tf, limit=600):
             bars = [dict(t=int(k[0]), o=float(k[1]), h=float(k[2]), l=float(k[3]), c=float(k[4]), v=float(k[5]), ct=int(k[6])) for k in rows]
             now = int(time.time() * 1000)
             bars = [b for b in bars if b["ct"] < now]  # solo velas cerradas
-            if bad_data(bars, tf):
-                _bad_src.add((_host(base), symbol))  # esta fuente tiene la moneda suspendida: usar la siguiente
+            if bad_data(bars, tf, symbol):
+                _set_bad(base, symbol, 20 * 60)  # esta fuente tiene la moneda suspendida o atrasada: usar otra 20 min
                 raise RuntimeError(f"{symbol} sin datos válidos en {_host(base)}")
             return bars
         except Exception as e:  # probar la siguiente fuente
@@ -203,8 +262,8 @@ def _fetch_long(base, symbol, tf, total):
         time.sleep(0.3)
     now = int(time.time() * 1000)
     out = [b for b in out if b["ct"] < now]
-    if bad_data(out, tf):
-        _bad_src.add((_host(base), symbol))
+    if bad_data(out, tf, symbol):
+        _set_bad(base, symbol, 20 * 60)
         raise RuntimeError(f"{symbol} sin datos válidos en {_host(base)}")
     return out
 
@@ -334,6 +393,7 @@ def dir4_series(sym, d):
 
 # ----------------------------- MODO DE CADA TEMPORALIDAD (igual que el indicador v8 en modo automático) -----------------------------
 LIM_W = (0.0, 0.40, 0.60)   # modo límite: sin entrada a mercado · orden límite en E2 (40 %) y E3 (60 %)
+BE_TFS = tuple(t for t in os.environ.get("BE_TFS", "15m,4h").split(",") if t)   # temporalidades con SL a la entrada tras TP1
 ALL_TFS = ("1m", "3m", "5m", "15m", "1h", "4h")
 DEFAULT_TFS = ["5m", "15m", "1h", "4h"]
 
@@ -342,18 +402,20 @@ def tf_mode(tf, st):
     """Auditoría v3.6 (24 monedas, comisiones de Bitunix):
     5m  → límite + a favor de la Tendencial de 15m (+0.20 R/op) · 4h → límite (+0.23 R/op)
     1m/3m → modo preciso (a favor de 15m y 4h, DCA 10/30/60) · 15m/1h → DCA 20/30/50 a mercado."""
+    be = tf in BE_TFS  # v4.6: SL a la entrada tras TP1 (backtest: 15m PF 0.96→1.07, 4h 1.04→1.10; en 1h empeora)
     if st.get("limit", True) and tf in ("5m", "4h"):
-        return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=["15m"] if tf == "5m" else [])
+        return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=["15m"] if tf == "5m" else [], be=be)
     if st.get("h4", True) and TF_MS.get(tf, 0) <= 300_000:
-        return dict(mode="low", W=LOW_W, min_dist=LOW_MIN_DIST, htf=["4h", "15m"])
-    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[])
+        return dict(mode="low", W=LOW_W, min_dist=LOW_MIN_DIST, htf=["4h", "15m"], be=be)
+    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[], be=be)
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia exacta del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
+def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False):
     """Señales y gestión vela a vela. dirs = Tendencial de temporalidades mayores que debe ir a favor.
     W[0] == 0 → modo límite: no se entra a mercado; si el precio llega al TP1 sin llenar E2, la orden se cancela.
-    Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta."""
+    Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta.
+    be=True (v4.6): al tocar TP1 el SL pasa a la entrada (+0.08 % para cubrir comisiones) y se cancelan E2/E3 pendientes."""
     min_dist = MIN_DIST if min_dist is None else min_dist
     st, di, atr, mom, adx, wt1, wt2, e200 = (I[k] for k in ("st", "dir", "atr", "mom", "adx", "wt1", "wt2", "ema"))
     events = []
@@ -394,10 +456,11 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
         if T and i > T["bar"]:
             s = T["side"]
             empty = T["pos"] == 0
-            if T["fills"] == 1 and (b["l"] <= T["e2"] if s == 1 else b["h"] >= T["e2"]):
+            dca_ok = not (be and T["tp"] >= 1)  # tras el TP1 (modo BE) ya no se compran más E2/E3
+            if dca_ok and T["fills"] == 1 and (b["l"] <= T["e2"] if s == 1 else b["h"] >= T["e2"]):
                 T["avg"] = (T["avg"] * T["pos"] + T["e2"] * W[1]) / (T["pos"] + W[1]); T["pos"] += W[1]; T["fills"] = 2
                 T["fees"] += W[1] * FEE_MAKER
-            if T["fills"] == 2 and (b["l"] <= T["e3"] if s == 1 else b["h"] >= T["e3"]):
+            if dca_ok and T["fills"] == 2 and (b["l"] <= T["e3"] if s == 1 else b["h"] >= T["e3"]):
                 T["avg"] = (T["avg"] * T["pos"] + T["e3"] * W[2]) / (T["pos"] + W[2]); T["pos"] += W[2]; T["fills"] = 3
                 T["fees"] += W[2] * FEE_MAKER
             if empty and T["pos"] > 0:
@@ -407,7 +470,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
                 T = None
                 continue  # orden límite sin llenar y el precio ya llegó al TP1 → cancelada
             if (b["l"] <= T["sl"]) if s == 1 else (b["h"] >= T["sl"]):
-                close_now, exit_px, reason = True, T["sl"], "stop"
+                close_now, exit_px, reason = True, T["sl"], "be" if T.get("moved") else "stop"
             else:
                 for k in range(T["tp"], 3):
                     px = T["tps"][k]
@@ -420,7 +483,9 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
                             T["remS"] -= TP_SPLIT[k]
                             T["tp"] = k + 1
                             if k == 0:
-                                events.append(dict(kind="TP1", bar=i, entry=T["bar"], side=s, price=px, q=T["q"]))
+                                events.append(dict(kind="TP1", bar=i, entry=T["bar"], side=s, price=px, q=T["q"], be=be))
+                                if be:
+                                    T["sl"], T["moved"] = T["avg"] * (1 + s * 0.0008), True
                         else:
                             close_now, exit_px, reason, exit_fee = True, px, "tp3", FEE_MAKER
                             T["tp"] = 3
@@ -463,18 +528,41 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
 
 
 # ----------------------------- TELEGRAM -----------------------------
+_tg_skew = [0.0]   # reloj de Telegram − reloj de este equipo (para comparar el mensaje fijado sin depender de la hora local)
+
+
+def tg_now():
+    return time.time() + _tg_skew[0]
+
+
 def tg(token, method, params=None, timeout=20):
+    """Llamada a Telegram. Si Telegram pide esperar (429) o falla la conexión, reintenta en vez de perder el aviso."""
     data = urllib.parse.urlencode(params).encode() if params else None
-    req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
+    for attempt in range(3):
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/{method}", data=data)
         try:
-            desc = json.loads(e.read().decode()).get("description", "")
-        except Exception:
-            desc = ""
-        raise RuntimeError(f"Telegram {method} {e.code}: {desc}") from None
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                out = json.loads(r.read().decode())
+            res = out.get("result") if isinstance(out, dict) else None
+            stamp = (res.get("edit_date") or (res.get("date") if method == "sendMessage" else None)) if isinstance(res, dict) else None
+            if stamp and abs(stamp - time.time()) < 300:  # reloj de Telegram (solo de algo que acaba de pasar)
+                _tg_skew[0] = stamp - time.time()
+            return out
+        except urllib.error.HTTPError as e:
+            try:
+                j = json.loads(e.read().decode())
+            except Exception:
+                j = {}
+            wait = (j.get("parameters") or {}).get("retry_after")
+            if e.code == 429 and attempt < 2:
+                time.sleep(min(int(wait or 5), 30) + 0.5)
+                continue
+            raise RuntimeError(f"Telegram {method} {e.code}: {j.get('description', '')}") from None
+        except urllib.error.URLError as e:  # sin conexión momentánea (no llegó a Telegram): reintentar
+            if attempt < 2 and not isinstance(getattr(e, "reason", None), socket.timeout):
+                time.sleep(2 + 3 * attempt)
+                continue
+            raise
 
 
 def kb(rows):
@@ -555,7 +643,11 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         lim = ev.get("limit")
         lines = [f"{icon} <b>{s}</b> {link} {icon}" + ("  📥 <b>ORDEN LÍMITE</b>" if lim else ""), ""]
         if extra.get("late"):
-            lines += [f"⏱ <i>Señal de hace {extra['late']} min (sigue activa)</i>", ""]
+            now_px = f" · precio ahora {money(extra['now_px'])}" if extra.get("now_px") else ""
+            lines += [f"⏱ <i>Señal de hace {extra['late']} min{now_px} (sigue activa, sin TP ni SL tocados)</i>", ""]
+        if extra.get("tradfi"):
+            lines += [f"🏛 <b>Activo tradicional</b>: apalancamiento limitado a {TRADFI_MAX_LEV}x" +
+                      (" · ⚠️ bolsa de EE. UU. cerrada ahora: el precio puede saltar en la apertura" if extra.get("night") else ""), ""]
         lines.append("📡 <b>OBJETIVO DETECTADO:</b>")
         if lim:
             w2, w3 = round(ev["w"][1] * 100), round(ev["w"][2] * 100)
@@ -576,14 +668,18 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         if tgt:
             lines.append(f"🧲 Tendencial {tgt[0]}: {money(tgt[1])} ({pct(tgt[1])})")
         qline = f"└── E2: {q2} · E3: {q3} {coin(sym)}" if lim else f"└── E1: {q1} · E2: {q2} · E3: {q3} {coin(sym)}"
-        lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk'] * scale:,.0f}):", qline, "",
-                  "⚓ <b>ESTRATEGIA:</b>"]
+        lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk'] * scale:,.0f}):", qline]
+        if extra.get("max_ops"):
+            n_open = extra.get("open_n", 0) + 1
+            lines.append(f"🧯 Operaciones abiertas con esta: {n_open}/{extra['max_ops']} · riesgo total ${ev['risk'] * scale * n_open:,.0f}")
+        lines += ["", "⚓ <b>ESTRATEGIA:</b>"]
+        be_line = ["├── 🔒 Al tocar TP1: SL a la entrada y cancela E2/E3 pendientes (te aviso)"] if tf in BE_TFS else []
         if lim:
             lines += ["├── 📥 Pon E2 y E3 como órdenes límite (ya con su SL y TP)",
-                      "├── ❌ Si el precio toca TP1 sin llenarlas, cancélalas (te aviso)",
+                      "├── ❌ Si el precio toca TP1 sin llenarlas, cancélalas (te aviso)"] + be_line + [
                       "└── ⚠️ Si llega aviso de DEBILIDAD, asegura ganancias"]
         else:
-            lines += ["└── ⚠️ Salir o asegurar cuando llegue aviso de DEBILIDAD"]
+            lines += be_line + ["└── ⚠️ Salir o asegurar cuando llegue aviso de DEBILIDAD"]
         lines += ["", "📻 <i>¿Disparas?</i>", "⚓ Opera en Bitunix · E2, E3 y TP con orden límite"]
         return "\n".join(lines)
     if k == "FILL":
@@ -600,9 +696,21 @@ def message(sym, tf, ev, extra=None, scale=1.0):
                           "💡 <i>Asegura ganancias: cierra una parte o sube el SL a la entrada</i>"])
     if k == "TP1":
         return "\n".join(["✅ <b>TP1 ALCANZADO</b> ✅", "", f"📊 Par: {link}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
-                          f"🎯 Precio: {money(ev['price'])}", "", "💡 <i>Cierra una parte y deja correr el resto</i>"])
+                          f"🎯 Precio: {money(ev['price'])}", "",
+                          "🔒 <b>Mueve el SL a la entrada</b> y cancela las órdenes E2/E3 que no se llenaron" if ev.get("be") else
+                          "💡 <i>Cierra una parte y deja correr el resto</i>",
+                          "💡 <i>El 40 % ya se cerró en TP1; el resto va a TP2/TP3 sin riesgo</i>" if ev.get("be") else ""])
+    if k == "SL":
+        return "\n".join(["⛔ <b>STOP LOSS TOCADO</b> ⛔", "", f"📊 Par: {link}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
+                          f"🛟 Precio: {money(ev['price'])}", "", "ℹ️ <i>Si tenías el SL puesto, la operación ya se cerró.</i>",
+                          "<i>El resultado en $ llega al cerrar la vela.</i>"])
+    if k == "WKND":
+        return "\n".join(["⚠️ <b>CIERRE DE FIN DE SEMANA</b> ⚠️", "", f"📊 Par: {link}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}", "",
+                          "🏛 El mercado real (bolsa / materias primas) cierra pronto hasta el domingo-lunes.",
+                          "📉 Al reabrir el precio puede saltar por encima de tu SL.",
+                          "💡 <i>Considera cerrar o reducir esta operación antes del cierre.</i>"])
     res = {"tp3": "🏁 TP3 alcanzado", "stop": "⛔ Stop loss" if not ev.get("tp") else "🏁 Resto cerrado en SL tras TP",
-           "reverse": "🔄 Señal contraria"}[ev["reason"]]
+           "reverse": "🔄 Señal contraria", "be": "🔒 Resto cerrado en la entrada tras TP1"}[ev["reason"]]
     pnl = ev["pnl"] * scale
     lines = ["⏰ <b>OPERACIÓN CERRADA</b> ⏰", "", f"📊 Par: {link}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
              f"{'💰' if pnl >= 0 else '🩸'} Resultado: {res} · {'+' if pnl >= 0 else '-'}${abs(pnl):,.2f} ({ev['r']:+.2f} R)",
@@ -702,6 +810,8 @@ def parse_num(args, amount=False):
 
 # ----------------------------- ESTADO -----------------------------
 CLOUD = os.environ.get("CLOUD") == "1"
+MAX_OPS = int(os.environ.get("MAX_OPS", "5"))   # operaciones abiertas a la vez por usuario (se cambia con /maxops)
+_st_lock = threading.Lock()
 
 
 def load_state():
@@ -749,12 +859,26 @@ def load_state():
         st.pop("quiet", None)
         st["v40"] = True
     st.setdefault("users", {"owner": {"name": "Admin", "tfs": list(DEFAULT_TFS)}})
+    st.setdefault("removed", [])   # monedas quitadas con /quitar (favoritos.txt no las vuelve a poner)
+    st.setdefault("max_ops", MAX_OPS)
+    if not st.get("v46"):  # v4.6: control de operaciones abiertas → las anteriores (sin vigilancia al minuto) cuentan como cerradas
+        for p in list(st.get("hist", {})):  # 15m y 4h cambian de regla (SL a la entrada tras TP1): winrate nuevo
+            if p.endswith(("_15m", "_4h")):
+                del st["hist"][p]
+        st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(("_15m", "_4h"))]
+        live_ids, sent0 = set(st.get("live", {})), set(st.get("sent", []))
+        for tid, tr in st.get("trades", {}).items():
+            if f"{tid}_CLOSE" in sent0 or f"{tid}_CANCEL" in sent0:
+                tr["closed"] = True
+            elif tid not in live_ids:
+                tr["legacy"] = True  # de la versión anterior: sigue recibiendo su cierre, pero no bloquea señales nuevas
+        st["v46"] = True
     fav = os.path.join(BASE, "favoritos.txt")  # monedas extra para la PC: una lista separada por comas o líneas
     if not CLOUD and os.path.exists(fav):
         with open(fav, encoding="utf-8") as f:
             for x in re.split(r"[,\s]+", f.read()):
                 x = norm_symbol(x) if x.strip() and not x.startswith("#") else ""
-                if x and x not in st["symbols"]:
+                if x and x not in st["symbols"] and x not in st["removed"]:
                     st["symbols"].append(x)
     if CLOUD:  # en GitHub las monedas se cambian en Settings → Variables → SYMBOLS
         st["top"] = int(os.environ.get("TOP", "30"))
@@ -771,7 +895,8 @@ def save_state(st, now):
     cutoff = now - 7 * 86_400_000
     st["sent"] = sorted(k for k in set(st["sent"]) if int(k.split("_")[-2]) >= cutoff)
     st["trades"] = {k: v for k, v in st.get("trades", {}).items() if v.get("t", 0) >= cutoff}
-    data = dict(st)
+    with _st_lock:  # el latido (otro hilo) también escribe en el estado
+        data = dict(st)
     if CLOUD:  # el repositorio es público: no se guardan datos de usuarios
         data.pop("users", None)
         data.pop("pending", None)
@@ -811,10 +936,30 @@ def user_scale(st, uid):
     return mine / base if base else 1.0
 
 
+def max_ops_of(st, uid):
+    return int(st["users"].get(uid, {}).get("max_ops", st.get("max_ops", MAX_OPS)))
+
+
+def open_trades(st, uid, now=None):
+    """Operaciones de este usuario que siguen abiertas (o con órdenes límite pendientes)."""
+    now = now or int(time.time() * 1000)
+    out = []
+    for tid, tr in st.get("trades", {}).items():
+        if tr.get("closed") or tr.get("cancelled") or tr.get("sl_hit") or tr.get("legacy") or uid not in tr.get("to", []):
+            continue
+        sym, tf, _ = tid.rsplit("_", 2)
+        if now - tr.get("t", 0) > 300 * TF_MS.get(tf, 900_000):  # demasiado vieja (seguridad)
+            continue
+        out.append((tid, sym, tf))
+    return out
+
+
 def settings_line(st, uid="owner"):
     u = st["users"].get(uid, {})
     cap, rk = u.get("capital", st["capital"]), u.get("risk", st["risk"])
+    mx = max_ops_of(st, uid)
     line = (f"💰 ${cap:,.0f} · riesgo {rk:g}% = ${cap * rk / 100:,.2f} por operación\n"
+            f"🧯 Máx. {mx} operaciones abiertas (riesgo total ${cap * rk / 100 * mx:,.0f}) · 1 por moneda\n"
             f"⏱ Tus temporalidades: {', '.join(u.get('tfs', [])) or 'ninguna (pausado)'}")
     if uid == "owner":
         line += (f"\n🛡 SL mínimo {MIN_DIST:g}% · 📥 modo límite 5m/4h: {'sí' if st.get('limit', True) else 'no'}"
@@ -827,6 +972,7 @@ HELP_USER = ("🤖 <b>Bridge Táctico · comandos</b>\n"
              "/config → elige tus temporalidades con botones\n"
              "/capital 500 → tu capital en $ (para calcular cantidades)\n"
              "/riesgo 1 → % de riesgo por operación\n"
+             "/maxops 5 → máximo de operaciones abiertas a la vez\n"
              "/winrate → acierto real de cada moneda y temporalidad\n"
              "/radar → tendencia de las monedas favoritas\n"
              "/estado → operaciones activas\n"
@@ -839,7 +985,8 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/limite si|no → 5m y 4h con órdenes límite (recomendado)\n"
               "/h4 si|no → modo preciso 1m/3m (a favor de 15m y 4h)\n"
               "/radar cada 30 · /radar off → radar automático\n"
-              "/nube → cómo funciona el respaldo en GitHub\n\n"
+              "/nube → cómo funciona el respaldo en GitHub\n"
+              "/actualizar → el servidor instala la última versión\n\n"
               "👥 Para compartir: pásale a tu amigo el enlace del bot. Al pulsar INICIAR te llega una solicitud para aprobarla.")
 
 
@@ -851,7 +998,8 @@ def config_rows(u):
 
 
 CONFIG_TXT = ("⚙️ <b>Tus avisos</b>\nToca una temporalidad para activarla ✅ o quitarla ▫️.\n"
-              "Recomendadas (con ventaja en la auditoría): <b>5m</b> y <b>4h</b>.")
+              "Mejor resultado en la auditoría v4.6 (datos reales, con comisiones): <b>15m</b> y <b>4h</b>.\n"
+              "1m, 3m y 5m dan más señales pero hoy pierden un poco: úsalas con riesgo bajo.")
 
 
 def send_config(token, chat_id, u):
@@ -874,13 +1022,13 @@ def handle_callback(token, owner, st, cq):
                 send_config(token, who, st["users"][who])
             except Exception as e:
                 print("aprobar:", e)
-            tg(token, "editMessageText", {"chat_id": cid, "message_id": mid, "text": f"✅ {name} aprobado"})
+            tg(token, "editMessageText", {"chat_id": cid, "message_id": mid, "parse_mode": "HTML", "text": f"✅ {name} aprobado"})
         else:
             try:
                 send(token, who, "❌ Tu solicitud no fue aprobada.")
             except Exception:
                 pass
-            tg(token, "editMessageText", {"chat_id": cid, "message_id": mid, "text": f"❌ {name} rechazado"})
+            tg(token, "editMessageText", {"chat_id": cid, "message_id": mid, "parse_mode": "HTML", "text": f"❌ {name} rechazado"})
     elif data.startswith("tf:") and uid in st["users"]:
         t = data[3:]
         tfs = st["users"][uid].setdefault("tfs", [])
@@ -937,6 +1085,7 @@ def command(token, owner, st, ctx, cid, msg):
         name = (frm.get("first_name", "") + " " + frm.get("last_name", "")).strip() or frm.get("username", "") or cid
         if frm.get("username"):
             name += f" (@{frm['username']})"
+        name = html.escape(name[:60])  # un nombre con < o & rompería el mensaje y no te llegaría la solicitud
         if cid in st["pending"]:
             reply("⏳ Tu solicitud ya está con el administrador. Te aviso cuando la apruebe.")
             return
@@ -972,6 +1121,13 @@ def command(token, owner, st, ctx, cid, msg):
             if is_owner:
                 st["risk"] = v
         reply(settings_line(st, uid))
+    elif cmd == "/maxops":
+        v = parse_num(args)
+        if v and 1 <= v <= 30:
+            me["max_ops"] = int(v)
+            if is_owner:
+                st["max_ops"] = int(v)
+        reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
     elif cmd == "/estado":
@@ -1005,6 +1161,8 @@ def command(token, owner, st, ctx, cid, msg):
             except Exception:
                 reply(f"⚠️ {s} no existe en Binance ni en Bitunix")
                 continue
+            if s in st["removed"]:
+                st["removed"].remove(s)
             if s not in st["symbols"]:
                 st["symbols"].append(s)
                 added.append(s)
@@ -1014,6 +1172,8 @@ def command(token, owner, st, ctx, cid, msg):
             s = norm_symbol(a)
             if s in st["symbols"]:
                 st["symbols"].remove(s)
+            if s not in st["removed"]:
+                st["removed"].append(s)
         reply("Favoritos: " + (", ".join(st["symbols"]) or "(vacío)"))
     elif cmd == "/top":
         v = parse_num(args)
@@ -1044,6 +1204,11 @@ def command(token, owner, st, ctx, cid, msg):
             st["pending"].pop(a, None)
             if gone:
                 reply(f"🚫 {gone.get('name', a)} ya no recibe señales")
+    elif cmd == "/actualizar":
+        if os.environ.get("INVOCATION_ID"):  # servidor con systemd: al salir se reinicia solo y baja la última versión de GitHub
+            reply(f"♻️ [{HOST}] reiniciando para instalar la última versión… (vuelve en 1-2 min)")
+            raise KeyboardInterrupt
+        reply("ℹ️ /actualizar solo funciona en el servidor. En la PC cierra la ventana y vuelve a abrir iniciar_bot.bat.")
     elif cmd == "/nube":
         reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{' ★' if MAIN else ''}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
               "dice cuál). El servidor 24/7 (★) tiene prioridad; si se apaga, toma el control la PC en 4 min. "
@@ -1185,27 +1350,29 @@ def compute(sym, tf, st):
     I = indicators(d)
     m = tf_mode(tf, st)
     dirs = [dir_series(sym, d, h) for h in m["htf"]] or None
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"])
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"])
     seed = None
     if pair not in st.get("hist_seeded", []):  # la primera vez: winrate con un historial largo
         try:
             dl = fetch_long(sym, tf, 3000)
             dl_dirs = [dir_series(sym, dl, h) for h in m["htf"]] or None
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"])
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"])
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3)) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
     return dict(sym=sym, tf=tf, d=d, up=I["dir"][-1] < 0, st=I["st"][-1], events=events, T=T, pts=last["pts"], seed=seed)
 
 
-def deliver(token, owner, st, uids, sym, tf, ev, extra=None):
-    """Envía un aviso a cada usuario con su propio capital/riesgo. Devuelve a quién llegó."""
+def deliver(token, owner, st, uids, sym, tf, ev, extra=None, per_user=None):
+    """Envía un aviso a cada usuario con su propio capital/riesgo. Devuelve a quién llegó.
+    per_user = {uid: datos extra solo para ese usuario} (p. ej. cuántas operaciones tiene abiertas)."""
     ok = []
     for uid in uids:
         if uid not in st["users"]:
             continue
+        ex = dict(extra or {}, **((per_user or {}).get(uid) or {}))
         try:
-            send(token, chat_of(uid, owner), message(sym, tf, ev, extra, user_scale(st, uid)),
+            send(token, chat_of(uid, owner), message(sym, tf, ev, ex, user_scale(st, uid)),
                  signal_buttons(sym, tf) if ev["kind"] == "OPEN" else None)
             ok.append(uid)
         except Exception as e:
@@ -1250,32 +1417,70 @@ def apply(res, st, ctx, token, owner, notify=True):
             continue
         age = now - d[ev["bar"]]["ct"]
         if ev["kind"] == "OPEN":
+            # Solo se avisa si la operación SIGUE VIVA (sin TP ni SL tocados) y no es de hace más de 3 velas.
             active = T is not None and T["bar"] == ev["bar"] and T["tp"] == 0
-            if not (age <= 2 * tfms + 120_000 or (active and age <= 3 * tfms + 120_000)):
-                continue  # demasiado vieja
-            uids = [u for u, p in st["users"].items() if tf in p.get("tfs", [])]
-            extra = {"hist": hist_stats(st, pair), "late": int(age // 60_000) if age > 150_000 else 0}
+            if not active or age > 3 * tfms + 120_000:
+                continue
+            late = age > 150_000
+            now_px = None
+            if late:  # con retraso: mirar el precio de AHORA (velas de 1m desde el cierre de la vela de la señal)
+                try:
+                    need = int((now - d[-1]["ct"]) // 60_000) + 2
+                    m1 = [b for b in fetch_klines(sym, "1m", min(max(need, 3), 1000)) if b["t"] > d[-1]["ct"]]
+                except Exception:
+                    m1 = []
+                if m1:
+                    now_px, s1 = m1[-1]["c"], ev["side"]
+                    hi, lo = max(b["h"] for b in m1), min(b["l"] for b in m1)
+                    if (hi >= ev["tps"][0] or lo <= ev["sl"]) if s1 == 1 else (lo <= ev["tps"][0] or hi >= ev["sl"]):
+                        continue  # en la vela que aún no cerró ya tocó TP1 o SL: la señal ya no sirve
+                    gone = (now_px - ev["price"]) / (ev["tps"][0] - ev["price"]) if ev["tps"][0] != ev["price"] else 0
+                    if gone >= 0.5 and not ev.get("limit"):
+                        continue  # no perseguir el precio: ya recorrió más de media distancia al TP1
+            kind = tradfi_kind(sym)
+            if kind:
+                if market_closed(kind):
+                    continue  # oro/acciones: no se abre nada con el mercado real cerrado o a punto de cerrar el fin de semana
+                ev = dict(ev, lev=min(ev["lev"], TRADFI_MAX_LEV))
+            uids, per_user = [], {}
+            for u, p in st["users"].items():
+                if tf not in p.get("tfs", []):
+                    continue
+                mine = open_trades(st, u, now)
+                if any(s2 == sym for _, s2, _ in mine):
+                    continue  # ya tiene una operación en esta moneda (Bitunix: una posición por moneda)
+                if len(mine) >= max_ops_of(st, u):
+                    continue  # ya tiene el máximo de operaciones abiertas
+                uids.append(u)
+                per_user[u] = {"open_n": len(mine), "max_ops": max_ops_of(st, u)}
+            extra = {"hist": hist_stats(st, pair), "late": int(age // 60_000) if late else 0, "now_px": now_px,
+                     "tradfi": bool(kind), "night": stocks_night(kind)}
             extra.update(open_extras(sym, tf, ev, ctx))
-            to = deliver(token, owner, st, uids, sym, tf, ev, extra)
+            to = deliver(token, owner, st, uids, sym, tf, ev, extra, per_user)
             if uids and not to:
                 sent.discard(key)  # no llegó a nadie (sin internet): se reintenta en la próxima vuelta
             if to:
-                trades[tid] = {"to": to, "t": d[ev["bar"]]["t"]}
-                if active:
-                    live[tid] = {"sym": sym, "tf": tf, "side": ev["side"], "e2": ev["e2"], "tp1": ev["tps"][0], "filled": not ev.get("limit"), "last": now}
+                trades[tid] = {"to": to, "t": d[ev["bar"]]["t"], "side": ev["side"]}
+                live[tid] = {"sym": sym, "tf": tf, "side": ev["side"], "e2": ev["e2"], "tp1": ev["tps"][0], "sl": ev["sl"],
+                             "filled": not ev.get("limit"), "last": now, "be": tf in BE_TFS}
         else:
             tr = trades.get(tid)
-            if not tr or tr.get("cancelled"):
+            if not tr or tr.get("cancelled") or (tr.get("closed") and ev["kind"] not in ("CANCEL", "CLOSE")):
                 continue  # nadie recibió esa señal (o ya se avisó que se canceló): no se manda un TP suelto
-            deliver(token, owner, st, tr["to"], sym, tf, ev)
             if ev["kind"] in ("CANCEL", "CLOSE"):
                 live.pop(tid, None)
-                if ev["kind"] == "CANCEL":
-                    tr["cancelled"] = True
+                tr["closed"] = True  # cerrada aunque el mensaje falle: no bloquea la señal nueva de la misma vela
+            rcpt = [u for u in tr["to"] if u in st["users"]]
+            got = deliver(token, owner, st, rcpt, sym, tf, ev)
+            if rcpt and not got:
+                sent.discard(key)  # Telegram no respondió: se reintenta en la próxima revisión de esta moneda
+                continue
+            if ev["kind"] == "CANCEL":
+                tr["cancelled"] = True
     # operaciones vigiladas al minuto: actualizar o retirar
     for tid in [t for t, v in live.items() if v["sym"] == sym and v["tf"] == tf]:
-        if not T or tid != f"{sym}_{tf}_{d[T['bar']]['t']}":
-            live.pop(tid, None)
+        if not T or tid != f"{sym}_{tf}_{d[T['bar']]['t']}" or T["tp"] >= 1:
+            live.pop(tid, None)  # cerrada, reemplazada o ya pasó TP1 (el resto llega al cierre de la vela)
         elif T["pos"] > 0:
             live[tid]["filled"] = True
     st["sent"] = list(sent)
@@ -1325,10 +1530,17 @@ def live_watch(token, owner, st):
                     trades[tid]["cancelled"] = True
                     live.pop(tid, None)
                     break
-            elif hit(v["tp1"]):
+            if v["filled"] and v.get("sl") and dip(v["sl"]):  # el stop va ANTES que el TP (igual que el cálculo al cierre)
+                if f"{tid}_SL" not in sent:
+                    sent.add(f"{tid}_SL")
+                    deliver(token, owner, st, to, v["sym"], v["tf"], dict(kind="SL", side=s, price=v["sl"]))
+                trades[tid]["sl_hit"] = True
+                live.pop(tid, None)  # el resultado en $ llega al cerrar la vela
+                break
+            if v["filled"] and hit(v["tp1"]):
                 if f"{tid}_TP1" not in sent:
                     sent.add(f"{tid}_TP1")
-                    deliver(token, owner, st, to, v["sym"], v["tf"], dict(kind="TP1", side=s, price=v["tp1"]))
+                    deliver(token, owner, st, to, v["sym"], v["tf"], dict(kind="TP1", side=s, price=v["tp1"], be=v.get("be")))
                 live.pop(tid, None)  # lo demás (TP2/TP3/SL y resultado) llega al cerrar la vela
                 break
             v["last"] = b["ct"]
@@ -1340,54 +1552,105 @@ HOST = (os.environ.get("BOT_NAME") or socket.gethostname() or "PC")[:24]   # nom
 MAIN = os.environ.get("BOT_MAIN") == "1"   # el servidor 24/7 tiene prioridad sobre la PC
 
 
+_hb_lock = threading.Lock()
+_leading = threading.Event()   # este equipo es el que envía las señales (el latido solo corre mientras lo sea)
+
+
 def heartbeat(token, owner, st, force=False, fresh=False):
     """Mensaje fijado en tu chat: qué equipo está enviando las señales. La nube y los otros equipos lo leen
     para no repetir avisos. fresh=True → mensaje nuevo (al tomar el control)."""
-    now = time.time()
-    if not force and now - st.get("hb_t", 0) < 120:
+    if not force and time.time() - st.get("hb_t", 0) < 120:
         return
-    st["hb_t"] = now
-    txt = (f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
-           f"{', '.join(scan_tfs(st))} · {len(st['users'])} usuario(s)")
-    mid = st.get("status_msg")
-    if mid and not fresh:
+    with _hb_lock:
+        now = time.time()
+        with _st_lock:
+            st["hb_t"] = now
         try:
-            tg(token, "editMessageText", {"chat_id": owner, "message_id": mid, "text": txt})
-            return
-        except Exception as e:
-            if "not modified" in str(e):
-                return
-    try:
-        r = send(token, owner, txt, silent=True)
-        new = r["result"]["message_id"]
-        if mid:
+            txt = (f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
+                   f"{', '.join(scan_tfs(st))} · {len(st['users'])} usuario(s)")
+        except Exception:  # (la lista de usuarios cambió justo ahora en el otro hilo)
+            txt = f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')}"
+        mid = st.get("status_msg")
+        if mid and not fresh:
             try:
-                tg(token, "unpinChatMessage", {"chat_id": owner, "message_id": mid})
-            except Exception:
-                pass
-        tg(token, "pinChatMessage", {"chat_id": owner, "message_id": new, "disable_notification": "true"})
-        st["status_msg"] = new
-    except Exception as e:
-        print("estado:", e)
+                tg(token, "editMessageText", {"chat_id": owner, "message_id": mid, "text": txt})
+                return
+            except Exception as e:
+                if "not modified" in str(e):
+                    return
+        try:
+            r = send(token, owner, txt, silent=True)
+            new = r["result"]["message_id"]
+            with _st_lock:
+                st["status_msg"] = new  # aunque fijarlo falle, no se manda otro mensaje en cada revisión
+            if mid:
+                try:
+                    tg(token, "unpinChatMessage", {"chat_id": owner, "message_id": mid})
+                except Exception:
+                    pass
+            tg(token, "pinChatMessage", {"chat_id": owner, "message_id": new, "disable_notification": "true"})
+            with _st_lock:
+                st["status_msg"] = new
+        except Exception as e:
+            print("estado:", e)
+
+
+def hb_loop(token, owner, st):
+    """Latido cada 60 s en su propio hilo: aunque una revisión tarde varios minutos, el mensaje fijado sigue fresco
+    y el otro equipo no cree que este se apagó (antes eso hacía que los dos enviaran señales a la vez)."""
+    while True:
+        time.sleep(60)
+        if _leading.is_set():
+            try:
+                heartbeat(token, owner, st, force=True)
+            except Exception as e:
+                print("latido:", e)
 
 
 def am_leader(token, owner, st, force=False):
     """Solo un bot (PC u Oracle) envía señales y contesta comandos. Si otro equipo actualizó el mensaje fijado
-    hace menos de 4 min, este espera; el que tiene ★ (servidor 24/7) siempre tiene prioridad."""
+    hace menos de 4 min (según el reloj de Telegram), este espera. El que tiene ★ (servidor 24/7) siempre tiene
+    prioridad: si ve que el fijado es de otro equipo, vuelve a fijar el suyo para que el otro se retire."""
     now = time.time()
-    if not force and now - st.get("lead_chk", 0) < 90:
+    if not force and now - st.get("lead_chk", 0) < 60:
         return st.get("leader", True)
     st["lead_chk"] = now
     try:
         pm = tg(token, "getChat", {"chat_id": owner})["result"].get("pinned_message") or {}
     except Exception as e:
         print("getChat:", e)
+        (_leading.set if st.get("leader", True) else _leading.clear)()
         return st.get("leader", True)
     txt = pm.get("text", "")
-    fresh = now - max(pm.get("date", 0), pm.get("edit_date", 0)) < 240
-    other = txt.startswith("🟢") and f"[{HOST}]" not in txt and fresh
-    st["leader"] = not other or (MAIN and "★" not in txt)
-    return st["leader"]
+    mine = (pm.get("message_id") and pm.get("message_id") == st.get("status_msg")) or f"[{HOST}]" in txt
+    fresh = tg_now() - max(pm.get("date", 0), pm.get("edit_date", 0)) < 240
+    other = txt.startswith("🟢") and not mine and fresh
+    leader = not other or (MAIN and "★" not in txt)
+    if leader and MAIN and not mine and not force and now - st.get("repin_t", 0) > 600:  # recuperar el fijado (máx. 1 vez cada 10 min)
+        st["repin_t"] = now
+        print(time.strftime("%H:%M:%S"), "★ el mensaje fijado era de otro equipo: se vuelve a fijar el de este servidor")
+        heartbeat(token, owner, st, force=True, fresh=True)
+    st["leader"] = leader
+    (_leading.set if leader else _leading.clear)()
+    return leader
+
+
+def weekend_warn(token, owner, st):
+    """Viernes 17-18 UTC: aviso a quien tenga abierta una operación de oro, plata, petróleo o acciones
+    (el mercado real cierra el fin de semana y al reabrir el precio puede saltar el SL)."""
+    g = time.gmtime()
+    if not (g.tm_wday == 4 and 17 <= g.tm_hour < 18):
+        return
+    sent = set(st["sent"])
+    for tid, tr in list(st.get("trades", {}).items()):
+        if tr.get("closed") or tr.get("cancelled") or tr.get("sl_hit") or f"{tid}_WKND" in sent:
+            continue
+        sym, tf, _ = tid.rsplit("_", 2)
+        if not tradfi_kind(sym):
+            continue
+        sent.add(f"{tid}_WKND")
+        deliver(token, owner, st, tr.get("to", []), sym, tf, dict(kind="WKND", side=tr.get("side", 1)))
+    st["sent"] = list(sent)
 
 
 def start_up(token, chat, st, ctx):
@@ -1425,11 +1688,13 @@ def pc_alive(token, owner):
 
 
 def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     t_save = time.time()
-    with ThreadPoolExecutor(max_workers=8) as ex:
-        futs = [(sym, tf, ex.submit(compute, sym, tf, st)) for sym, tf in pairs]
-        for n, (sym, tf, f) in enumerate(futs, 1):
+    ex = ThreadPoolExecutor(max_workers=8)
+    try:
+        futs = {ex.submit(compute, sym, tf, st): (sym, tf) for sym, tf in pairs}
+        for n, f in enumerate(as_completed(futs), 1):  # cada señal sale apenas está lista (una moneda lenta no frena a las demás)
+            sym, tf = futs[f]
             try:
                 apply(f.result(), st, ctx, token, owner, notify)
             except Exception as e:
@@ -1440,6 +1705,10 @@ def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
                 save_state(st, int(time.time() * 1000))
                 heartbeat(token, owner, st)
                 t_save = time.time()
+    except BaseException:  # Ctrl+C / reinicio del servidor: no esperar a las monedas en cola
+        ex.shutdown(wait=False, cancel_futures=True)
+        raise
+    ex.shutdown(wait=True)
 
 
 def run_once(token, owner, st, ctx, notify=True, progress=False):
@@ -1475,47 +1744,74 @@ def main():
         return
 
     print(f"Bridge Táctico bot en marcha [{HOST}{' ★' if MAIN else ''}] (cierra la ventana o Ctrl+C para detener)…")
+
+    def _stop(*_):  # el servidor se reinicia una vez al día (systemd manda SIGTERM): guardar antes de salir
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _stop)
+    except Exception:
+        pass
+    threading.Thread(target=hb_loop, args=(token, chat, st), daemon=True).start()
     leader = am_leader(token, chat, st, force=True)
-    if leader:
-        start_up(token, chat, st, ctx)
-    last_min = None
-    while True:
-        try:
-            was, leader = leader, am_leader(token, chat, st)
-            if not leader:
-                if was:
-                    print(time.strftime("%H:%M:%S"), "⏸ Otro equipo está enviando las señales (mensaje fijado 🟢): este bot queda en espera")
-                time.sleep(10)
-                continue
-            if not was:
-                print(time.strftime("%H:%M:%S"), "▶ Este bot toma el control")
-                ctx.clear()
-                start_up(token, chat, st, ctx)
-            handle_commands(token, chat, st, ctx)
-            now = time.time()
-            minute = int(now // 60)
-            if minute != last_min and now % 60 >= 3:  # 3 s después del cierre de cada vela de 1m
-                last_min = minute
-                syms = active_symbols(st)
-                tfs = scan_tfs(st)
-                pairs = [(sym, tf) for sym in syms for tf in tfs if minute % (TF_MS[tf] // 60_000) == 0 or (sym, tf) not in ctx]
-                t0 = time.time()
-                scan(pairs, st, ctx, token, chat)
-                live_watch(token, chat, st)
-                heartbeat(token, chat, st)
-                every = st.get("radar_every", 0)
-                if every and minute % every == 0:  # radar automático a Telegram
-                    try:
-                        send(token, chat, radar_report(st, ctx))
-                    except Exception as e:
-                        print("radar:", e)
-                save_state(st, int(now * 1000))
-                print(time.strftime("%H:%M:%S"), f"revisado: {len(syms)} monedas · {len(pairs)} gráficos en {time.time() - t0:.0f}s", "|", ", ".join(tfs))
-        except KeyboardInterrupt:
-            break
-        except Exception as e:
-            print("error:", e)
-        time.sleep(2)
+    done = {}  # temporalidad -> última vela revisada (si una revisión dura más de 1 min, no se salta ningún cierre)
+    try:
+        if leader:
+            m0 = int(time.time() // 60)  # velas que cierren DURANTE el arranque se revisan después
+            start_up(token, chat, st, ctx)
+            done = {tf: m0 // (TF_MS[tf] // 60_000) for tf in ALL_TFS}
+        last_min = None
+        while True:
+            try:
+                was, leader = leader, am_leader(token, chat, st)
+                if not leader:
+                    if was:
+                        print(time.strftime("%H:%M:%S"), "⏸ Otro equipo está enviando las señales (mensaje fijado 🟢): este bot queda en espera")
+                    time.sleep(10)
+                    continue
+                if not was:
+                    print(time.strftime("%H:%M:%S"), "▶ Este bot toma el control")
+                    ctx.clear()
+                    m0 = int(time.time() // 60)
+                    start_up(token, chat, st, ctx)
+                    done = {tf: m0 // (TF_MS[tf] // 60_000) for tf in ALL_TFS}
+                handle_commands(token, chat, st, ctx)
+                now = time.time()
+                minute = int(now // 60)
+                if minute != last_min and now % 60 >= 3:  # 3 s después del cierre de cada vela de 1m
+                    last_min = minute
+                    syms = active_symbols(st)
+                    tfs = scan_tfs(st)
+                    due = {tf for tf in ALL_TFS if done.get(tf) != minute // (TF_MS[tf] // 60_000)}
+                    pairs = [(sym, tf) for sym in syms for tf in tfs if tf in due or (sym, tf) not in ctx]
+                    for tid, tr in st.get("trades", {}).items():  # operaciones abiertas: se siguen aunque la moneda ya no esté en la lista
+                        if not (tr.get("closed") or tr.get("cancelled")):
+                            s2, t2, _ = tid.rsplit("_", 2)
+                            if t2 in TF_MS and (s2, t2) not in pairs and (t2 in due or (s2, t2) not in ctx):
+                                pairs.append((s2, t2))
+                    t0 = time.time()
+                    scan(pairs, st, ctx, token, chat)
+                    for tf in due:
+                        done[tf] = minute // (TF_MS[tf] // 60_000)
+                    live_watch(token, chat, st)
+                    weekend_warn(token, chat, st)
+                    heartbeat(token, chat, st)
+                    every = st.get("radar_every", 0)
+                    if every and minute % every == 0:  # radar automático a Telegram
+                        try:
+                            send(token, chat, radar_report(st, ctx))
+                        except Exception as e:
+                            print("radar:", e)
+                    save_state(st, int(now * 1000))
+                    print(time.strftime("%H:%M:%S"), f"revisado: {len(syms)} monedas · {len(pairs)} gráficos en {time.time() - t0:.0f}s", "|", ", ".join(tfs))
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                print("error:", e)
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print("Deteniendo: guardando el estado…")
+        _leading.clear()
+        save_state(st, int(time.time() * 1000))
 
 
 if __name__ == "__main__":
