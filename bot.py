@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.9.1 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v4.9.2 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -648,59 +648,45 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     pair, TF = sym + ".P", tf.upper()
     link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     k = ev["kind"]
-    if k == "OPEN":
+    if k == "OPEN":  # v4.9.2: formato corto, lo importante arriba
         e1 = ev["price"]
-        pct = lambda x: f"{(x - e1) / e1 * 100:+.2f}%"
+        pct = lambda x: f"{(x - e1) / e1 * 100:+.1f}%"
         q1, q2, q3 = (fq(x * scale) for x in ev["qty"])
         lim = ev.get("limit")
-        lines = [f"{icon} <b>{s}</b> {link} {icon}" + ("  📥 <b>ORDEN LÍMITE</b>" if lim else ""), ""]
+        c = coin(sym)
+        lines = [f"{icon} <b>{s}</b> · {link} · {ev['q']}/3" + ("  📥 <b>LÍMITE</b>" if lim else ""), ""]
         if extra.get("late"):
-            now_px = f" · precio ahora {money(extra['now_px'])}" if extra.get("now_px") else ""
-            lines += [f"⏱ <i>Señal de hace {extra['late']} min{now_px} (sigue activa, sin TP ni SL tocados)</i>", ""]
+            lines.append(f"⏱ <i>Señal de hace {extra['late']} min" + (f" · precio ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
         if extra.get("tradfi"):
-            lines += [f"🏛 <b>Activo tradicional</b>: apalancamiento limitado a {TRADFI_MAX_LEV}x" +
-                      (" · ⚠️ bolsa de EE. UU. cerrada ahora: el precio puede saltar en la apertura" if extra.get("night") else ""), ""]
-        lines.append("📡 <b>OBJETIVO DETECTADO:</b>")
+            lines.append(f"🏛 Activo tradicional: máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada ahora" if extra.get("night") else ""))
         if lim:
-            w2, w3 = round(ev["w"][1] * 100), round(ev["w"][2] * 100)
-            lines += [f"├── 💲 Precio actual: {money(e1)} (<b>no</b> entrar a mercado)",
-                      f"├── 📥 Límite E2 ({w2}%): {money(ev['e2'])} ({pct(ev['e2'])})",
-                      f"├── 📥 Límite E3 ({w3}%): {money(ev['e3'])} ({pct(ev['e3'])})"]
+            lines += [f"💲 Precio ahora {money(e1)} · <b>no entrar a mercado</b>",
+                      f"📥 E2 {money(ev['e2'])} ({pct(ev['e2'])}) · {q2} {c}",
+                      f"📥 E3 {money(ev['e3'])} ({pct(ev['e3'])}) · {q3} {c}"]
         else:
-            lines += [f"├── 💰 Entrada: {money(e1)}",
-                      f"├── 💰 DCA: E2: {money(ev['e2'])} · E3: {money(ev['e3'])}"]
-        lines += [f"├── 🛟 Stop Loss: {money(ev['sl'])} ({pct(ev['sl'])})",
-                  f"├── ⚡ Apalancamiento recomendado: <b>{ev['lev']}x</b>",
-                  f"└── {wr_line(extra.get('hist'))}", "",
-                  "🎯 <b>TAKE PROFITS:</b>",
-                  f"├── TP1: {money(ev['tps'][0])} ({pct(ev['tps'][0])})",
-                  f"├── TP2: {money(ev['tps'][1])} ({pct(ev['tps'][1])})",
-                  f"└── TP3: {money(ev['tps'][2])} ({pct(ev['tps'][2])})"]
-        tgt = extra.get("htf_tp")
-        if tgt:
-            lines.append(f"🧲 Tendencial {tgt[0]}: {money(tgt[1])} ({pct(tgt[1])})")
+            lines += [f"💰 Entrada {money(e1)} · {q1} {c}",
+                      f"📥 DCA E2 {money(ev['e2'])} ({pct(ev['e2'])}) · {q2} {c}",
+                      f"📥 DCA E3 {money(ev['e3'])} ({pct(ev['e3'])}) · {q3} {c}"]
+        lines += [f"🛑 SL {money(ev['sl'])} ({pct(ev['sl'])}) · ⚡ <b>{ev['lev']}x</b>",
+                  f"🎯 TP1 {money(ev['tps'][0])} ({pct(ev['tps'][0])})",
+                  f"🎯 TP2 {money(ev['tps'][1])} ({pct(ev['tps'][1])})",
+                  f"🎯 TP3 {money(ev['tps'][2])} ({pct(ev['tps'][2])})", "",
+                  wr_line(extra.get("hist"))]
         if extra.get("conf"):
-            lines.append(f"🔥 <b>Confluencia</b>: {s} activo también en {' · '.join(extra['conf'])} ({len(extra['conf']) + 1} temporalidades)")
-        if extra.get("btc"):
-            lines.append("₿ BTC: " + " · ".join(f"{t} {'▲' if u else '▼'}" for t, u in extra["btc"]))
-        qline = f"└── E2: {q2} · E3: {q3} {coin(sym)}" if lim else f"└── E1: {q1} · E2: {q2} · E3: {q3} {coin(sym)}"
-        lines += ["", f"📦 <b>CANTIDAD</b> (riesgo ${ev['risk'] * scale:,.0f}):", qline]
-        n_open = extra.get("open_n", 0) + 1
-        if extra.get("max_ops"):
-            lines.append(f"🧯 Operaciones abiertas con esta: {n_open}/{extra['max_ops']} · riesgo total ${ev['risk'] * scale * n_open:,.0f}")
-        elif "open_n" in extra:
-            lines.append(f"🧯 Operaciones abiertas con esta: {n_open} · riesgo total ${ev['risk'] * scale * n_open:,.0f}")
+            lines.append(f"🔥 Confluencia: también {s} en {' · '.join(extra['conf'])}")
         if extra.get("same"):
-            lines.append(f"⚠️ Ya tienes {coin(sym)} abierta en {', '.join(extra['same'])}: en Bitunix es una sola posición por moneda (se suman)")
-        lines += ["", "⚓ <b>ESTRATEGIA:</b>"]
-        be_line = ["├── 🔒 Al tocar TP1: SL a la entrada y cancela E2/E3 pendientes (te aviso)"] if tf in BE_TFS else []
+            lines.append(f"⚠️ Ya tienes {c} abierta en {', '.join(extra['same'])} (en Bitunix se suman)")
+        if "open_n" in extra:
+            n_open = extra.get("open_n", 0) + 1
+            lines.append(f"🧯 Abiertas con esta: {n_open}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else "") +
+                         f" · riesgo ${ev['risk'] * scale:,.0f} c/u")
+        tips = ["E2/E3 como órdenes límite"] if lim else []
         if lim:
-            lines += ["├── 📥 Pon E2 y E3 como órdenes límite (ya con su SL y TP)",
-                      "├── ❌ Si el precio toca TP1 sin llenarlas, cancélalas (te aviso)"] + be_line + [
-                      "└── ⚠️ Si llega aviso de DEBILIDAD, asegura ganancias"]
-        else:
-            lines += be_line + ["└── ⚠️ Salir o asegurar cuando llegue aviso de DEBILIDAD"]
-        lines += ["", "📻 <i>¿Disparas?</i>", "⚓ Opera en Bitunix · E2, E3 y TP con orden límite"]
+            tips.append("si toca TP1 sin llenarse, cancela")
+        if tf in BE_TFS:
+            tips.append("en TP1 mueve el SL a la entrada")
+        tips.append("⚠️ debilidad = asegura")
+        lines += ["", "📋 <i>" + " · ".join(tips) + "</i>"]
         return "\n".join(lines)
     if k == "FILL":
         return "\n".join([f"📥 <b>ORDEN LLENADA</b> {icon}", "", f"📊 Par: {link}", f"{icon} Tipo: {s}",
@@ -1395,7 +1381,7 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n):
         wr.append(f"{t} ⚪—" if h["n"] < 5 else f"{t} {wr_dot(h)}{h['wr']:.0f}%")
     lines.append("🏆 Winrate de esta moneda: " + " · ".join(wr))
     if sym != "BTCUSDT" and ("BTCUSDT", "1h") in ctx:
-        lines.append("₿ BTC: " + dirs_line("BTCUSDT", ctx, ("15m", "1h", "4h", "1d")))
+        lines.append("₿ Tendencia de BTC: " + dirs_line("BTCUSDT", ctx, ("15m", "1h", "4h", "1d")))
     if len(tfs) >= CONF_MIN:
         lines += ["", "📊 <i>Backtest 50 monedas: las señales con 3 o más temporalidades activas a la vez ganaron más que el resto "
                       "(factor 1.10-1.22 frente a 0.94-1.03). No es seguro: usa siempre el SL.</i>"]
@@ -1772,8 +1758,6 @@ def apply(res, st, ctx, token, owner, notify=True):
                      "tradfi": bool(kind), "night": stocks_night(kind)}
             extra.update(open_extras(sym, tf, ev, ctx))
             extra["conf"] = [t for t in ALL_TFS if t != tf and ((ctx.get((sym, t)) or {}).get("T") or {}).get("side") == ev["side"]]
-            if sym != "BTCUSDT":
-                extra["btc"] = [(t, ctx[("BTCUSDT", t)]["up"]) for t in ("15m", "1h", "4h", "1d") if ("BTCUSDT", t) in ctx]
             to = deliver(token, owner, st, uids, sym, tf, ev, extra, per_user)
             if uids and not to:
                 sent.discard(key)  # no llegó a nadie (sin internet): se reintenta en la próxima vuelta
