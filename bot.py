@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.3 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.4 (misma lógica que el indicador Bridge Táctico v8)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -438,6 +438,8 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None):
             events.append(dict(kind="CLOSE", bar=i, entry=T["bar"], side=T["side"], price=exit_px, q=T["q"], win=pnl_usd > 0, tp=T["tp"],
                                reason=reason, pnl=pnl_usd, r=pnl_usd / risk_usd))
             T = None
+        if T and i > T["bar"] and T["pos"] > 0 and ((T["side"] == 1 and last_xdn == i) or (T["side"] == -1 and last_xup == i)):
+            events.append(dict(kind="WEAK", bar=i, entry=T["bar"], side=T["side"], price=b["c"]))  # debilidad: WaveTrend gira en contra
         if new_side and not T:
             s, e1 = new_side, b["c"]
             e2 = st[i]
@@ -578,9 +580,10 @@ def message(sym, tf, ev, extra=None, scale=1.0):
                   "⚓ <b>ESTRATEGIA:</b>"]
         if lim:
             lines += ["├── 📥 Pon E2 y E3 como órdenes límite (ya con su SL y TP)",
-                      "└── ❌ Si el precio toca TP1 sin llenarlas, cancélalas (te aviso)"]
+                      "├── ❌ Si el precio toca TP1 sin llenarlas, cancélalas (te aviso)",
+                      "└── ⚠️ Si llega aviso de DEBILIDAD, asegura ganancias"]
         else:
-            lines += ["└── ⏰ Salir cuando indique señal de tiempo"]
+            lines += ["└── ⚠️ Salir o asegurar cuando llegue aviso de DEBILIDAD"]
         lines += ["", "📻 <i>¿Disparas?</i>", "⚓ Opera en Bitunix · E2, E3 y TP con orden límite"]
         return "\n".join(lines)
     if k == "FILL":
@@ -590,6 +593,11 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         why = "el precio llegó al TP1 sin tocar tu entrada" if ev.get("reason") == "tp1" else "apareció la señal contraria"
         return "\n".join(["❌ <b>ORDEN CANCELADA</b> ❌", "", f"📊 Par: {link}", f"{icon} Tipo: {s}",
                           f"ℹ️ {why}.", "", "🗑 <b>Cancela tus órdenes límite E2/E3 de esta señal</b>"])
+    if k == "WEAK":
+        return "\n".join(["⚠️ <b>DEBILIDAD</b> ⚠️", "", f"📊 Par: {link}", f"{icon} Tipo: {s}", f"💲 Precio: {money(ev['price'])}", "",
+                          "📉 WaveTrend giró en contra en zona extrema: la operación pierde fuerza." if ev["side"] == 1 else
+                          "📈 WaveTrend giró en contra en zona extrema: la operación pierde fuerza.",
+                          "💡 <i>Asegura ganancias: cierra una parte o sube el SL a la entrada</i>"])
     if k == "TP1":
         return "\n".join(["✅ <b>TP1 ALCANZADO</b> ✅", "", f"📊 Par: {link}", f"⏰ Temporalidad: {TF}", f"{icon} Tipo: {s}",
                           f"🎯 Precio: {money(ev['price'])}", "", "💡 <i>Cierra una parte y deja correr el resto</i>"])
