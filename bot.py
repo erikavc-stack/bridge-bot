@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.4 (misma lógica que el indicador Bridge Táctico v8)
+Bridge Táctico → Telegram  ·  v4.5 (misma lógica que el indicador Bridge Táctico v8)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 4h y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
   orden llenada, TP1, orden cancelada y cierre con el resultado en $.
@@ -15,7 +15,7 @@ Modos:
   python bot.py --loop   → corre sin parar en tu PC (señales al instante, todas las temporalidades)
   python bot.py          → una sola pasada (GitHub Actions: respaldo 15m/1h/4h cuando la PC está apagada)
 """
-import json, os, re, sys, time, threading
+import json, os, re, sys, time, threading, socket
 import urllib.request, urllib.parse, urllib.error
 
 try:
@@ -1045,9 +1045,9 @@ def command(token, owner, st, ctx, cid, msg):
             if gone:
                 reply(f"🚫 {gone.get('name', a)} ya no recibe señales")
     elif cmd == "/nube":
-        reply("☁️ <b>Respaldo en GitHub</b>\nMientras esta PC está encendida, ella envía todas las señales al instante "
-              "(el mensaje fijado 🟢 lo indica). Si la PC se apaga, GitHub avisa 15m, 1h y 4h, pero solo al administrador "
-              "y con 5-30 min de retraso (GitHub no es puntual).")
+        reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{' ★' if MAIN else ''}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
+              "dice cuál). El servidor 24/7 (★) tiene prioridad; si se apaga, toma el control la PC en 4 min. "
+              "Si no hay ninguno, GitHub avisa 15m, 1h y 4h solo al administrador y con 5-30 min de retraso.")
 
 
 def status_report(st, ctx, uid="owner"):
@@ -1336,16 +1336,21 @@ def live_watch(token, owner, st):
 
 
 # ----------------------------- PC ENCENDIDA / NUBE DE RESPALDO -----------------------------
-def heartbeat(token, owner, st, force=False):
-    """Mensaje fijado en tu chat que dice que la PC está activa. La nube lo lee: si está al día, no repite avisos."""
+HOST = (os.environ.get("BOT_NAME") or socket.gethostname() or "PC")[:24]   # nombre de este equipo (PC, ORACLE…)
+MAIN = os.environ.get("BOT_MAIN") == "1"   # el servidor 24/7 tiene prioridad sobre la PC
+
+
+def heartbeat(token, owner, st, force=False, fresh=False):
+    """Mensaje fijado en tu chat: qué equipo está enviando las señales. La nube y los otros equipos lo leen
+    para no repetir avisos. fresh=True → mensaje nuevo (al tomar el control)."""
     now = time.time()
-    if not force and now - st.get("hb_t", 0) < 300:
+    if not force and now - st.get("hb_t", 0) < 120:
         return
     st["hb_t"] = now
-    txt = (f"🟢 Bot de la PC activo · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
+    txt = (f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
            f"{', '.join(scan_tfs(st))} · {len(st['users'])} usuario(s)")
     mid = st.get("status_msg")
-    if mid:
+    if mid and not fresh:
         try:
             tg(token, "editMessageText", {"chat_id": owner, "message_id": mid, "text": txt})
             return
@@ -1364,6 +1369,48 @@ def heartbeat(token, owner, st, force=False):
         st["status_msg"] = new
     except Exception as e:
         print("estado:", e)
+
+
+def am_leader(token, owner, st, force=False):
+    """Solo un bot (PC u Oracle) envía señales y contesta comandos. Si otro equipo actualizó el mensaje fijado
+    hace menos de 4 min, este espera; el que tiene ★ (servidor 24/7) siempre tiene prioridad."""
+    now = time.time()
+    if not force and now - st.get("lead_chk", 0) < 90:
+        return st.get("leader", True)
+    st["lead_chk"] = now
+    try:
+        pm = tg(token, "getChat", {"chat_id": owner})["result"].get("pinned_message") or {}
+    except Exception as e:
+        print("getChat:", e)
+        return st.get("leader", True)
+    txt = pm.get("text", "")
+    fresh = now - max(pm.get("date", 0), pm.get("edit_date", 0)) < 240
+    other = txt.startswith("🟢") and f"[{HOST}]" not in txt and fresh
+    st["leader"] = not other or (MAIN and "★" not in txt)
+    return st["leader"]
+
+
+def start_up(token, chat, st, ctx):
+    """Primera revisión completa al arrancar (o al tomar el control)."""
+    n_pairs = len(active_symbols(st)) * len(scan_tfs(st))
+    nuevos = sum(1 for s in active_symbols(st) for t in scan_tfs(st) if f"{s}_{t}" not in st.get("hist_seeded", []))
+    print(f"Revisando {n_pairs} gráficos" + (f" ({nuevos} calculan su winrate por primera vez: tarda unos minutos)" if nuevos else ""))
+    try:
+        send(token, chat, f"⏳ <b>Bot iniciando [{HOST}]</b>: revisando {n_pairs} gráficos" +
+             (f" ({nuevos} calculan su winrate por primera vez, tarda unos minutos)." if nuevos else "."), silent=True)
+    except Exception as e:
+        print("telegram:", e)
+    heartbeat(token, chat, st, force=True, fresh=True)  # avisa enseguida que este equipo tomó el control
+    run_once(token, chat, st, ctx, progress=True)
+    heartbeat(token, chat, st, force=True)
+    try:
+        send(token, chat, f"🤖 <b>Bridge Táctico v4 activo [{HOST}]</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
+                          "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) +
+                          "\n\n/config → elegir temporalidades · /ayuda → comandos", silent=True)
+    except Exception as e:
+        print("telegram:", e)
+    st["init"] = True
+    save_state(st, int(time.time() * 1000))
 
 
 def pc_alive(token, owner):
@@ -1391,6 +1438,7 @@ def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
                 print(time.strftime("%H:%M:%S"), f"preparando: {n}/{len(futs)} gráficos")
             if progress and time.time() - t_save > 60:  # la primera vez tarda: se guarda el avance cada minuto
                 save_state(st, int(time.time() * 1000))
+                heartbeat(token, owner, st)
                 t_save = time.time()
 
 
@@ -1410,7 +1458,7 @@ def main():
         if CLOUD and not alive and pm.get("text", "").startswith("🟢"):
             try:
                 tg(token, "editMessageText", {"chat_id": chat, "message_id": pm["message_id"],
-                                              "text": "☁️ PC apagada · avisos 15m, 1h y 4h desde GitHub (pueden llegar con 5-30 min de retraso)"})
+                                              "text": "☁️ PC y servidor apagados · avisos 15m, 1h y 4h desde GitHub (pueden llegar con 5-30 min de retraso)"})
             except Exception as e:
                 print("estado:", e)
         run_once(token, chat, st, ctx, notify=not alive)
@@ -1419,35 +1467,30 @@ def main():
         if not st["init"] or os.environ.get("TEST") == "1":
             send(token, chat, ("🤖 <b>Bridge Táctico (nube) activo</b>" if not st["init"] else "🧪 <b>Prueba nube OK</b>") +
                  f"\nVigilando {len(active_symbols(st))} monedas en {', '.join(t.upper() for t in scan_tfs(st))}.\n" +
-                 ("🟢 La PC está encendida: ella envía las señales al instante; la nube queda de respaldo." if alive
-                  else "☁️ La PC está apagada: la nube envía 15m, 1h y 4h."))
+                 ("🟢 Hay un bot activo (PC o servidor): él envía las señales al instante; GitHub queda de respaldo." if alive
+                  else "☁️ No hay ningún bot activo: GitHub envía 15m, 1h y 4h."))
         st["init"] = True
         save_state(st, int(time.time() * 1000))
         print("PC activa:", alive)
         return
 
-    print("Bridge Táctico bot en marcha (cierra la ventana o Ctrl+C para detener)…")
-    n_pairs = len(active_symbols(st)) * len(scan_tfs(st))
-    nuevos = sum(1 for s in active_symbols(st) for t in scan_tfs(st) if f"{s}_{t}" not in st.get("hist_seeded", []))
-    print(f"Revisando {n_pairs} gráficos" + (f" ({nuevos} calculan su winrate por primera vez: tarda unos minutos)" if nuevos else ""))
-    try:
-        send(token, chat, f"⏳ <b>Bot iniciando</b>: revisando {n_pairs} gráficos" +
-             (f" ({nuevos} calculan su winrate por primera vez, tarda unos minutos)." if nuevos else "."), silent=True)
-    except Exception as e:
-        print("telegram:", e)
-    run_once(token, chat, st, ctx, progress=True)
-    heartbeat(token, chat, st, force=True)
-    try:
-        send(token, chat, f"🤖 <b>Bridge Táctico v4 activo</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
-                          "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) +
-                          "\n\n/config → elegir temporalidades · /ayuda → comandos", silent=True)
-    except Exception as e:
-        print("telegram:", e)
-    st["init"] = True
-    save_state(st, int(time.time() * 1000))
+    print(f"Bridge Táctico bot en marcha [{HOST}{' ★' if MAIN else ''}] (cierra la ventana o Ctrl+C para detener)…")
+    leader = am_leader(token, chat, st, force=True)
+    if leader:
+        start_up(token, chat, st, ctx)
     last_min = None
     while True:
         try:
+            was, leader = leader, am_leader(token, chat, st)
+            if not leader:
+                if was:
+                    print(time.strftime("%H:%M:%S"), "⏸ Otro equipo está enviando las señales (mensaje fijado 🟢): este bot queda en espera")
+                time.sleep(10)
+                continue
+            if not was:
+                print(time.strftime("%H:%M:%S"), "▶ Este bot toma el control")
+                ctx.clear()
+                start_up(token, chat, st, ctx)
             handle_commands(token, chat, st, ctx)
             now = time.time()
             minute = int(now // 60)
