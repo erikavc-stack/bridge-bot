@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.9.2 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v4.9.3 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -1357,37 +1357,34 @@ def dirs_line(sym, ctx, tfs=CONF_TFS):
 
 
 def conf_message(st, ctx, sym, side, tfs, newest, ups, n):
+    """v4.9.3: formato corto, igual que la señal normal."""
     s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
     fav = ups if side == 1 else n - ups
     c = ctx[(sym, newest)]
     T = c["T"]
-    pct = lambda x: f"{(x - T['e1']) / T['e1'] * 100:+.2f}%"
+    pct = lambda x: f"{(x - T['e1']) / T['e1'] * 100:+.1f}%"
     age = max(0, int((time.time() * 1000 - c["t_open"]) // 60_000))
     lev = min(T["lev"], TRADFI_MAX_LEV) if tradfi_kind(sym) else T["lev"]
-    lines = [f"🔥 <b>CONFLUENCIA {s}</b> · <a href=\"{chart_url(sym, newest)}\">{sym}.P</a> {icon}", "",
-             f"✓ {s} activo en <b>{len(tfs)} temporalidades</b>: {' · '.join(tfs)}",
-             f"📈 Tendencial a favor en {fav} de {n}: {dirs_line(sym, ctx)}", "",
-             f"🆕 <b>Última señal: {newest} {T['q']}/3</b> (hace {age} min)"]
+    link = f"<a href=\"{chart_url(sym, newest)}\">{sym}.P</a>"
+    lines = [f"🔥 <b>CONFLUENCIA {s}</b> · {link} {icon}", "",
+             f"✓ <b>{len(tfs)} temporalidades</b> en {s}: {' · '.join(tfs)}",
+             f"📈 Tendencial a favor: {fav}/{n}  ({dirs_line(sym, ctx)})", "",
+             f"🆕 <b>Señal de {newest}</b> · {T['q']}/3 · hace {age} min"]
     if T["pos"] == 0:
-        lines.append(f"├── 📥 Órdenes límite: E2 {money(T['e2'])} ({pct(T['e2'])}) · E3 {money(T['e3'])} ({pct(T['e3'])})")
+        lines.append(f"📥 Límite E2 {money(T['e2'])} ({pct(T['e2'])}) · E3 {money(T['e3'])} ({pct(T['e3'])})")
     else:
-        lines.append(f"├── 💰 Entrada {money(T['e1'])} · DCA {money(T['e2'])} / {money(T['e3'])}")
-    lines += [f"├── 🛟 SL {money(T['sl'])} ({pct(T['sl'])})",
-              f"├── 🎯 TP1 {money(T['tps'][0])} · TP2 {money(T['tps'][1])} · TP3 {money(T['tps'][2])}" + (" (TP1 ✓)" if T.get("tp") else ""),
-              f"└── ⚡ {lev}x"]
+        lines.append(f"💰 Entrada {money(T['e1'])} · DCA {money(T['e2'])} / {money(T['e3'])}")
+    lines += [f"🛑 SL {money(T['sl'])} ({pct(T['sl'])}) · ⚡ <b>{lev}x</b>",
+              f"🎯 TP1 {money(T['tps'][0])} · TP2 {money(T['tps'][1])} · TP3 {money(T['tps'][2])}" + ("  (TP1 ✓)" if T.get("tp") else ""), ""]
     wr = []
     for t in tfs:
         h = hist_stats(st, f"{sym}_{t}")
         wr.append(f"{t} ⚪—" if h["n"] < 5 else f"{t} {wr_dot(h)}{h['wr']:.0f}%")
-    lines.append("🏆 Winrate de esta moneda: " + " · ".join(wr))
-    if sym != "BTCUSDT" and ("BTCUSDT", "1h") in ctx:
-        lines.append("₿ Tendencia de BTC: " + dirs_line("BTCUSDT", ctx, ("15m", "1h", "4h", "1d")))
+    lines.append("🏆 Winrate: " + " · ".join(wr))
     if len(tfs) >= CONF_MIN:
-        lines += ["", "📊 <i>Backtest 50 monedas: las señales con 3 o más temporalidades activas a la vez ganaron más que el resto "
-                      "(factor 1.10-1.22 frente a 0.94-1.03). No es seguro: usa siempre el SL.</i>"]
+        lines.append("📊 <i>Con 3+ temporalidades a la vez el backtest gana más (factor 1.1-1.2). Usa siempre el SL.</i>")
     else:
-        lines += ["", f"₿ <i>Vigilancia de {coin(sym)}: aviso desde 2 temporalidades. Con solo 2 el backtest no mostró ventaja clara: "
-                      "tómalo como contexto.</i>"]
+        lines.append(f"₿ <i>Vigilancia de {coin(sym)}: solo 2 temporalidades, tómalo como contexto.</i>")
     return "\n".join(lines)
 
 
