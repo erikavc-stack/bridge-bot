@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v4.9.3 (misma lógica que el indicador Bridge Táctico v8.5 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v4.9.4 (misma lógica que el indicador Bridge Táctico v8.6 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -16,8 +16,10 @@ Modos:
   python bot.py --loop   → corre sin parar en tu PC (señales al instante, todas las temporalidades)
   python bot.py          → una sola pasada (GitHub Actions: respaldo 15m/1h/4h cuando la PC está apagada)
 """
-import json, os, re, sys, time, threading, socket, signal, html
+import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
+
+VERSION = "4.9.4"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -376,15 +378,16 @@ def indicators(d):
 _h4_cache = {}
 
 
-def dir_series(sym, d, htf="4h"):
-    """Dirección de la Tendencial de una temporalidad mayor en su última vela CERRADA (1 alcista, -1 bajista)."""
+def dir_series(sym, d, htf="4h", limit=499):
+    """Dirección de la Tendencial de una temporalidad mayor en su última vela CERRADA (1 alcista, -1 bajista).
+    v4.9.4: 499 velas (peso 2 en Binance); 1500 solo para el historial largo del winrate."""
     ms = TF_MS[htf]
     bucket = int(time.time() * 1000) // ms
     c = _h4_cache.get((sym, htf))
-    if not c or c[0] != bucket:
-        kk = fetch_klines(sym, htf, 1500)
+    if not c or c[0] != bucket or c[2] < limit:
+        kk = fetch_klines(sym, htf, limit)
         _, dh = supertrend(kk, ST_FACTOR, ST_ATR)
-        _h4_cache[(sym, htf)] = (bucket, {b["t"]: (1 if dh[j] < 0 else -1) for j, b in enumerate(kk)})
+        _h4_cache[(sym, htf)] = (bucket, {b["t"]: (1 if dh[j] < 0 else -1) for j, b in enumerate(kk)}, limit)
     m = _h4_cache[(sym, htf)][1]
     return [m.get((b["t"] // ms - 1) * ms) for b in d]
 
@@ -808,7 +811,8 @@ def parse_num(args, amount=False):
     if amount and re.fullmatch(r"\d{1,3}([.,]\d{3})+", s):  # 2.000 o 2,000 = dos mil
         s = s.replace(".", "").replace(",", "")
     try:
-        return float(s.replace(",", "."))
+        v = float(s.replace(",", "."))
+        return v if math.isfinite(v) else None   # "nan" / "inf" no son números válidos
     except ValueError:
         return None
 
@@ -868,7 +872,7 @@ def load_state():
     st.setdefault("removed", [])   # monedas quitadas con /quitar (favoritos.txt no las vuelve a poner)
     st.setdefault("max_ops", MAX_OPS)
     if not st.get("v491"):  # v4.9.1: se envían TODAS las señales (el usuario decide); el límite queda opcional con /maxops
-        st["max_ops"] = 0
+        st["max_ops"] = MAX_OPS
         for u in st.get("users", {}).values():
             u.pop("max_ops", None)
         st["v491"] = True
@@ -887,8 +891,8 @@ def load_state():
     fav = os.path.join(BASE, "favoritos.txt")  # monedas extra para la PC: una lista separada por comas o líneas
     if not CLOUD and os.path.exists(fav):
         with open(fav, encoding="utf-8") as f:
-            for x in re.split(r"[,\s]+", f.read()):
-                x = norm_symbol(x) if x.strip() and not x.startswith("#") else ""
+            for x in re.split(r"[,\s]+", re.sub(r"#[^\n]*", "", f.read())):  # todo lo que sigue a # es comentario
+                x = norm_symbol(x) if x.strip() else ""
                 if x and x not in st["symbols"] and x not in st["removed"]:
                     st["symbols"].append(x)
     if CLOUD:  # en GitHub las monedas se cambian en Settings → Variables → SYMBOLS
@@ -973,7 +977,7 @@ def user_scale(st, uid):
 
 
 def max_ops_of(st, uid):
-    return int(st["users"].get(uid, {}).get("max_ops", st.get("max_ops", MAX_OPS)))
+    return int(st["users"].get(uid, {}).get("max_ops", MAX_OPS))  # v4.9.4: el /maxops del admin ya no se aplica a los amigos
 
 
 def open_trades(st, uid, now=None):
@@ -1178,8 +1182,6 @@ def command(token, owner, st, ctx, cid, msg):
         v = parse_num(args)
         if v is not None and 0 <= v <= 100:
             me["max_ops"] = int(v)
-            if is_owner:
-                st["max_ops"] = int(v)
         reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
@@ -1270,9 +1272,21 @@ def command(token, owner, st, ctx, cid, msg):
             raise KeyboardInterrupt
         reply("ℹ️ /actualizar solo funciona en el servidor. En la PC cierra la ventana y vuelve a abrir iniciar_bot.bat.")
     elif cmd == "/nube":
-        reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{' ★' if MAIN else ''}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
+        reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{' ★' if MAIN else ''} · v{VERSION}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
               "dice cuál). El servidor 24/7 (★) tiene prioridad; si se apaga, toma el control la PC en 4 min. "
               "Si no hay ninguno, GitHub avisa 15m, 1h y 4h solo al administrador y con 5-30 min de retraso.")
+
+
+def clip_lines(lines, limit=3800):
+    """Junta líneas completas hasta ~3800 caracteres (Telegram rechaza > 4096 o una etiqueta HTML cortada)."""
+    out, n = [], 0
+    for i, ln in enumerate(lines):
+        if n + len(ln) + 1 > limit:
+            out.append(f"… y {len(lines) - i} línea(s) más")
+            break
+        out.append(ln)
+        n += len(ln) + 1
+    return "\n".join(out)
 
 
 def status_report(st, ctx, uid="owner"):
@@ -1287,8 +1301,10 @@ def status_report(st, ctx, uid="owner"):
                      f"E2 {fmt(T['e2'])} · SL {fmt(T['sl'])} · {estado}")
     if len(lines) == 1:
         lines.append("Ninguna en tus temporalidades.")
+    if len(lines) > 46:
+        lines = lines[:46] + [f"… y {len(lines) - 46} más"]
     lines.append(settings_line(st, uid))
-    return "\n".join(lines[:60])
+    return clip_lines(lines)
 
 
 def winrate_report(st, uid="owner"):
@@ -1301,8 +1317,7 @@ def winrate_report(st, uid="owner"):
             cells.append(f"{tf.upper()} ⚪ —" if h["n"] < 5 else f"{tf.upper()} {wr_dot(h)} {h['wr']:.0f}% · {h['avg']:+.2f}R ({h['n']})")
         lines.append(f"<b>{coin(sym)}</b>  " + " · ".join(cells))
     lines.append("\n🟢 gana ≥ +0.05 R/op · 🟡 ~0 · 🔴 pierde · ⚪ menos de 5 operaciones")
-    out = "\n".join(lines)
-    return out if len(out) < 4000 else out[:3900] + "\n…"
+    return clip_lines(lines[:-1], 3600) + "\n" + lines[-1]
 
 
 def radar_report(st, ctx, uid="owner"):
@@ -1323,8 +1338,7 @@ def radar_report(st, ctx, uid="owner"):
         bias = f" · {round(ups / n * 100)}% ▲" if n else ""
         lines.append(f"<b>{coin(sym)}</b>{bias}  " + "  ".join(cells))
     lines.append("\n▲▼ tendencia · ◦ tocando la Tendencial · 🟢/🔴 LONG/SHORT activo (calidad)")
-    out = "\n".join(lines)
-    return out if len(out) < 4000 else out[:3900] + "\n…"
+    return clip_lines(lines[:-1], 3600) + "\n" + lines[-1]
 
 
 # ----------------------------- PROCESO -----------------------------
@@ -1393,6 +1407,7 @@ def confluence(token, owner, st, ctx, notify=True):
     Solo si la última señal es reciente (máx. 3 velas) y sin repetir el mismo aviso antes de 4 h."""
     mem = st.setdefault("conf", {})
     now = int(time.time() * 1000)
+    st["conf_t"] = now
     for sym in conf_symbols(st):
         act, ups, n = conf_active(sym, ctx)
         if n < len(CONF_TFS) - 1:
@@ -1418,8 +1433,8 @@ def confluence(token, owner, st, ctx, notify=True):
             m["sent_n"], m["sent_t"] = len(tfs), now
             if not notify:
                 continue
-            rcpt = [u for u, p in st["users"].items()
-                    if (p.get("conf", True) and len(tfs) >= CONF_MIN) or (major and p.get("maj", True))]
+            rcpt = [u for u, p in st["users"].items() if p.get("tfs")
+                    and ((p.get("conf", True) and len(tfs) >= CONF_MIN) or (major and p.get("maj", True)))]
             txt = conf_message(st, ctx, sym, side, tfs, newest, ups, n)
             ok = 0
             for uid in rcpt:
@@ -1434,7 +1449,8 @@ def confluence(token, owner, st, ctx, notify=True):
 def majors_watch(token, owner, st, ctx, notify=True):
     """BTC y ETH de cerca: aviso cuando su Tendencial de 1h, 4h o 1d cambia de dirección (contexto de todo el mercado)."""
     mem = st.setdefault("maj_dir", {})
-    rcpt = [u for u, p in st["users"].items() if p.get("maj", True)]
+    st["maj_t"] = int(time.time() * 1000)
+    rcpt = [u for u, p in st["users"].items() if p.get("maj", True) and p.get("tfs")]
     for sym in MAJORS:
         for tf in MAJ_FLIP_TFS:
             c = ctx.get((sym, tf))
@@ -1570,8 +1586,7 @@ def stats_report(st, uid="owner", days=30, now=None):
     if worst:
         lines.append("⚠️ Peores: " + worst)
     lines.append("\nR = resultado en riesgos (1 R = lo que pierdes si toca el SL), comisiones incluidas.\n/stats 7 · /stats 90 · /stats todo")
-    out = "\n".join(lines)
-    return out if len(out) < 4000 else out[:3900] + "\n…"
+    return clip_lines(lines)
 
 
 # Tendencial de cualquier temporalidad (última vela cerrada), con caché por vela
@@ -1639,10 +1654,12 @@ def active_symbols(st):
 _last1m = {}  # moneda -> últimas velas de 1m (para vigilar TP/entradas al minuto sin pedir más datos)
 
 
-def compute(sym, tf, st):
+def compute(sym, tf, st, want=None):
     """Descarga y calcula una moneda/temporalidad. No toca el estado (se puede ejecutar en paralelo)."""
     pair = f"{sym}_{tf}"
-    d = fetch_klines(sym, tf, 1000 if tf in scan_tfs(st) else 499)  # solo confluencia: 499 velas (pesa 2 en Binance, no 5)
+    if want is None:
+        want = set(scan_tfs(st))
+    d = fetch_klines(sym, tf, 1000 if tf in want else 499)  # solo confluencia: 499 velas (pesa 2 en Binance, no 5)
     if tf == "1m":
         _last1m[sym] = (time.time(), d[-5:])
     I = indicators(d)
@@ -1650,10 +1667,10 @@ def compute(sym, tf, st):
     dirs = [dir_series(sym, d, h) for h in m["htf"]] or None
     events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"])
     seed = None
-    if pair not in st.get("hist_seeded", []) and tf in scan_tfs(st):  # la primera vez: winrate con un historial largo
+    if pair not in st.get("hist_seeded", []) and tf in want:  # la primera vez: winrate con un historial largo
         try:
             dl = fetch_long(sym, tf, 3000)
-            dl_dirs = [dir_series(sym, dl, h) for h in m["htf"]] or None
+            dl_dirs = [dir_series(sym, dl, h, 1500) for h in m["htf"]] or None
             evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"])
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3)) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
@@ -1966,12 +1983,15 @@ def start_up(token, chat, st, ctx):
     except Exception as e:
         print("telegram:", e)
     heartbeat(token, chat, st, force=True, fresh=True)  # avisa enseguida que este equipo tomó el control
+    t_now = int(time.time() * 1000)
+    recent_c = t_now - st.get("conf_t", 0) < 15 * 60_000   # reinicio corto (/actualizar): lo que se armó mientras tanto sí se avisa
+    recent_m = t_now - st.get("maj_t", 0) < 15 * 60_000    # (la memoria guardada evita repetir lo ya enviado)
     run_once(token, chat, st, ctx, progress=True)
-    confluence(token, chat, st, ctx, notify=False)   # lo que ya estaba armado al arrancar no se avisa de nuevo
-    majors_watch(token, chat, st, ctx, notify=False)
+    confluence(token, chat, st, ctx, notify=recent_c)
+    majors_watch(token, chat, st, ctx, notify=recent_m)
     heartbeat(token, chat, st, force=True)
     try:
-        send(token, chat, f"🤖 <b>Bridge Táctico v4 activo [{HOST}]</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
+        send(token, chat, f"🤖 <b>Bridge Táctico v{VERSION} activo [{HOST}]</b>\nVigilando {len(active_symbols(st))} monedas en {', '.join(scan_tfs(st))}.\n"
                           "Cada señal llega en su propio mensaje.\n\n" + settings_line(st) +
                           "\n\n/config → elegir temporalidades · /ayuda → comandos", silent=True)
     except Exception as e:
@@ -1996,15 +2016,20 @@ def scan(pairs, st, ctx, token, owner, notify=True, progress=False):
     t_save = time.time()
     ex = ThreadPoolExecutor(max_workers=8)
     try:
-        futs = {ex.submit(compute, sym, tf, st): (sym, tf) for sym, tf in pairs}
-        for n, f in enumerate(as_completed(futs), 1):  # cada señal sale apenas está lista (una moneda lenta no frena a las demás)
-            sym, tf = futs[f]
+        want = set(scan_tfs(st))
+        futs = {ex.submit(compute, sym, tf, st, want): (sym, tf) for sym, tf in pairs}
+        total = len(futs)
+        for n, f in enumerate(as_completed(list(futs)), 1):  # cada señal sale apenas está lista (una moneda lenta no frena a las demás)
+            sym, tf = futs.pop(f)   # v4.9.4: se suelta cada resultado (1000 velas) apenas se usa → menos memoria en el servidor
             try:
-                apply(f.result(), st, ctx, token, owner, notify)
+                res = f.result()
+                del f
+                apply(res, st, ctx, token, owner, notify)
+                del res
             except Exception as e:
                 print(f"⚠️ {sym} {tf}: {e}")
-            if progress and (n % 20 == 0 or n == len(futs)):
-                print(time.strftime("%H:%M:%S"), f"preparando: {n}/{len(futs)} gráficos")
+            if progress and (n % 20 == 0 or n == total):
+                print(time.strftime("%H:%M:%S"), f"preparando: {n}/{total} gráficos")
             if progress and time.time() - t_save > 60:  # la primera vez tarda: se guarda el avance cada minuto
                 save_state(st, int(time.time() * 1000))
                 heartbeat(token, owner, st)
@@ -2092,6 +2117,9 @@ def main():
                             s2, t2, _ = tid.rsplit("_", 2)
                             if t2 in TF_MS and (s2, t2) not in pairs and (t2 in due or (s2, t2) not in ctx):
                                 pairs.append((s2, t2))
+                    keep = set(all_pairs(st)) | set(pairs)
+                    for k in [k for k in ctx if k not in keep]:
+                        del ctx[k]
                     t0 = time.time()
                     scan(pairs, st, ctx, token, chat)
                     for tf in due:
