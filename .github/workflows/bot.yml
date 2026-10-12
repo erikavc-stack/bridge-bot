@@ -24,26 +24,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Sin secretos en el repositorio
+        run: |
+          test ! -e config.json || { echo "::error::config.json está en el repositorio: bórralo y haz /revoke en @BotFather"; exit 1; }
+          ! git grep -lIE '[0-9]{8,10}:[A-Za-z0-9_-]{35}' -- . ':!state.json' || { echo "::error::Hay un token de Telegram en el repositorio: bórralo y haz /revoke en @BotFather"; exit 1; }
+
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.10"   # la misma versión que el servidor de Oracle (Ubuntu 22.04)
 
       - name: Revisar mercado y avisar
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CLOUD: "1"
-          SYMBOLS: ${{ vars.SYMBOLS || 'BTCUSDT,ETHUSDT' }}   # monedas: Settings → Secrets and variables → Actions → Variables → SYMBOLS
-          TIMEFRAMES: "15m,1h,4h"   # respaldo cuando la PC está apagada (con la PC encendida, ella envía todo al instante)
-          COMMANDS: "0"          # los comandos (/radar, /winrate...) los contesta el bot de tu PC
+          SYMBOLS: ${{ vars.SYMBOLS }}   # vacío = favoritos.txt (o la variable SYMBOLS en Settings → Secrets and variables → Actions → Variables)
+          TIMEFRAMES: "15m,1h,4h"   # respaldo cuando Oracle y la PC están apagados
+          COMMANDS: "0"          # los comandos (/radar, /winrate...) los contesta Oracle o la PC
           CAPITAL: "2000"
           RISK_PCT: "2"
           TEST: ${{ github.event_name == 'workflow_dispatch' && inputs.test && '1' || '' }}
-        run: python bot.py
+        run: |
+          [ -n "$SYMBOLS" ] || SYMBOLS=$(sed 's/#.*//' favoritos.txt | tr '\n' ' ')
+          [ -n "${SYMBOLS// /}" ] || SYMBOLS="BTCUSDT,ETHUSDT"
+          export SYMBOLS
+          python bot.py
 
       - name: Guardar estado (evita avisos repetidos)
         run: |
           git config user.name "bridge-bot"
           git config user.email "bridge-bot@users.noreply.github.com"
           git add state.json
-          git diff --cached --quiet || (git commit -m "estado" && git push)
+          git diff --cached --quiet || { git commit -q -m "estado" && for i in 1 2 3; do git pull --rebase -q && git push -q && break; sleep 5; done; }
