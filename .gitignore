@@ -1,0 +1,6 @@
+# Nunca subir: tienen tu token o datos de tus usuarios
+config.json
+state.json.bak
+state.json.tmp
+oracle_instalar_mio.sh
+__pycache__/
