@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.0 (misma lógica que el indicador Bridge Táctico v8.7 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.0.1 (misma lógica que el indicador Bridge Táctico v8.8 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.0"
+VERSION = "5.0.1"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -664,6 +664,7 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         W = ev.get("w") or DCA_W
         q1, q2, q3 = (fq(x * scale) for x in ev["qty"])
         avg_all = e1 * W[0] + ev["e2"] * W[1] + ev["e3"] * W[2]
+        pa = lambda x: f"{ev['side'] * (x - avg_all) / avg_all * 100:+.2f}%"   # v5.0.1 (+ = a favor, − = en contra): SL/TP desde TU precio medio (en modo límite no entras al precio de la señal)
         margin = sum(ev.get("margin") or [0]) * scale
         risk = ev["risk"] * scale
         cc = ev.get("c") or (True, False, False)
@@ -688,14 +689,14 @@ def message(sym, tf, ev, extra=None, scale=1.0):
                       f"   E3 límite {money(ev['e3'])} ({pct(ev['e3'])}) · {q3} {c} · {W[2]*100:.0f}%"]
         lines += [f"   Precio medio con todo lleno: {money(avg_all)}",
                   "🛑 <b>STOP LOSS</b>",
-                  f"   {money(ev['sl'])} ({pct(ev['sl'])}) → si toca pierdes <b>${risk:,.2f}</b>",
+                  f"   {money(ev['sl'])} ({pa(ev['sl'])} desde tu entrada media) → si toca pierdes <b>${risk:,.2f}</b>",
                   f"⚡ Apalancamiento <b>{ev['lev']}x</b> (aislado) · margen total ${margin:,.2f}",
                   "🎯 <b>TAKE PROFIT</b>"]
         for i_, (tp, part) in enumerate(zip(ev["tps"], TP_SPLIT)):
-            lines.append(f"   TP{i_ + 1} {money(tp)} ({pct(tp)}) · cierra {part*100:.0f}% · {TP_R[i_]:g}R")
+            lines.append(f"   TP{i_ + 1} {money(tp)} ({pa(tp)}) · cierra {part*100:.0f}% · {TP_R[i_]:g}R")
         if extra.get("htf_tp"):
             t_, lvl_ = extra["htf_tp"]
-            lines.append(f"   🧲 Tendencial de {t_} en {money(lvl_)} ({pct(lvl_)}): posible freno")
+            lines.append(f"   🧲 Tendencial de {t_} en {money(lvl_)} ({pa(lvl_)}): posible freno")
         lines.append(bar)
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
@@ -1415,6 +1416,9 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
              bar, f"📈 Tendencial ({fav}/{n} a favor del {s}):", f"   {dirs_line(sym, ctx)}",
              bar, f"🆕 <b>PLAN · señal más reciente: {newest}</b> · ⭐ {T['q']}/3 · hace {age} min"]
     qty = T.get("qty") or [0, 0, 0]
+    ws = [qq * ee for qq, ee in zip(qty, (T["e1"], T["e2"], T["e3"]))]
+    avg_c = sum(ws) / sum(qty) if sum(qty) > 0 else T["e1"]   # v5.0.1: precio medio planeado (SL/TP en % desde ahí)
+    pa = lambda x: f"{side * (x - avg_c) / avg_c * 100:+.2f}%"
     if T["pos"] == 0:
         lines += [f"   Solo órdenes LÍMITE (no entres a mercado):",
                   f"   E2 {money(T['e2'])} ({pct(T['e2'])}) · {fq(qty[1] * scale)} {c_}",
@@ -1424,9 +1428,9 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
                   f"   E2 límite {money(T['e2'])} ({pct(T['e2'])}) · {fq(qty[1] * scale)} {c_}",
                   f"   E3 límite {money(T['e3'])} ({pct(T['e3'])}) · {fq(qty[2] * scale)} {c_}"]
     risk = st.get("capital", 0) * st.get("risk", 0) / 100 * scale   # el tamaño se calcula para perder exactamente esto en el SL
-    lines.append(f"🛑 SL {money(T['sl'])} ({pct(T['sl'])})" + (f" → pierdes ${risk:,.2f}" if risk else "") + f" · ⚡ <b>{lev}x</b>")
+    lines.append(f"🛑 SL {money(T['sl'])} ({pa(T['sl'])} desde tu entrada media)" + (f" → pierdes ${risk:,.2f}" if risk else "") + f" · ⚡ <b>{lev}x</b>")
     for i_, tp in enumerate(T["tps"]):
-        lines.append(f"🎯 TP{i_ + 1} {money(tp)} ({pct(tp)})" + (" ✓ ya tocado" if T.get("tp", 0) > i_ else ""))
+        lines.append(f"🎯 TP{i_ + 1} {money(tp)} ({pa(tp)})" + (" ✓ ya tocado" if T.get("tp", 0) > i_ else ""))
     lines += [bar, "📋 <b>Detalle por temporalidad</b>"]
     for t in tfs:
         Tt = ctx[(sym, t)]["T"]
