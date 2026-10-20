@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.0.1 (misma lógica que el indicador Bridge Táctico v8.8 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.1 (misma lógica que el indicador Bridge Táctico v9.0 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.0.1"
+VERSION = "5.1"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -656,66 +656,55 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     pair, TF = sym + ".P", tf.upper()
     link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     k = ev["kind"]
-    if k == "OPEN":  # v5.0: formato detallado y ordenado (dirección · plan · riesgo · objetivos · contexto)
+    if k == "OPEN":  # v5.1: detallado pero compacto (~13 líneas)
         e1 = ev["price"]
-        pct = lambda x: f"{(x - e1) / e1 * 100:+.2f}%"
         lim = ev.get("limit")
         c = coin(sym)
         W = ev.get("w") or DCA_W
         q1, q2, q3 = (fq(x * scale) for x in ev["qty"])
         avg_all = e1 * W[0] + ev["e2"] * W[1] + ev["e3"] * W[2]
-        pa = lambda x: f"{ev['side'] * (x - avg_all) / avg_all * 100:+.2f}%"   # v5.0.1 (+ = a favor, − = en contra): SL/TP desde TU precio medio (en modo límite no entras al precio de la señal)
+        pa = lambda x: f"{ev['side'] * (x - avg_all) / avg_all * 100:+.1f}%"   # + a favor / − en contra, desde tu precio medio
+        pe = lambda x: f"{(x - e1) / e1 * 100:+.1f}%"
         margin = sum(ev.get("margin") or [0]) * scale
         risk = ev["risk"] * scale
         cc = ev.get("c") or (True, False, False)
-        why = " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip(("Tendencial", "Momentum+ADX", "WaveTrend"), cc))
-        dir_w = "COMPRA" if ev["side"] == 1 else "VENTA"
-        bar = "━━━━━━━━━━━━━━━"
-        lines = [f"{icon} <b>{s} ({dir_w}) · {c}</b> · {TF} {icon}",
-                 f"{link} · ⭐ calidad <b>{ev['q']}/3</b>" + (f" · 🕐 {extra['hm']}" if extra.get("hm") else ""),
-                 f"✅ {why}"]
+        why = " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip(("Tend", "Mom", "WT"), cc))
+        bar = "━━━━━━━━━━━━"
+        lines = [f"{icon} <b>{s} · {c} {tf}</b> · {ev['q']}/3" + (" ⭐" if ev["q"] == 3 else "") + (f" · {extra['hm']}" if extra.get("hm") else ""),
+                 f"{link} · {why}"]
         if extra.get("late"):
-            lines.append(f"⏱ <i>Señal de hace {extra['late']} min" + (f" · precio ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
+            lines.append(f"⏱ <i>de hace {extra['late']} min" + (f" · ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
         if extra.get("tradfi"):
-            lines.append(f"🏛 Activo tradicional: máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada ahora" if extra.get("night") else ""))
-        lines += [bar, "📍 <b>ENTRADA</b>" + (" — solo órdenes LÍMITE, <b>no entres a mercado</b>" if lim else "")]
-        if lim:
-            lines += [f"   Precio ahora {money(e1)}",
-                      f"   E2 límite {money(ev['e2'])} ({pct(ev['e2'])}) · {q2} {c} · {W[1]*100:.0f}%",
-                      f"   E3 límite {money(ev['e3'])} ({pct(ev['e3'])}) · {q3} {c} · {W[2]*100:.0f}%"]
-        else:
-            lines += [f"   E1 mercado {money(e1)} · {q1} {c} · {W[0]*100:.0f}%",
-                      f"   E2 límite {money(ev['e2'])} ({pct(ev['e2'])}) · {q2} {c} · {W[1]*100:.0f}%",
-                      f"   E3 límite {money(ev['e3'])} ({pct(ev['e3'])}) · {q3} {c} · {W[2]*100:.0f}%"]
-        lines += [f"   Precio medio con todo lleno: {money(avg_all)}",
-                  "🛑 <b>STOP LOSS</b>",
-                  f"   {money(ev['sl'])} ({pa(ev['sl'])} desde tu entrada media) → si toca pierdes <b>${risk:,.2f}</b>",
-                  f"⚡ Apalancamiento <b>{ev['lev']}x</b> (aislado) · margen total ${margin:,.2f}",
-                  "🎯 <b>TAKE PROFIT</b>"]
-        for i_, (tp, part) in enumerate(zip(ev["tps"], TP_SPLIT)):
-            lines.append(f"   TP{i_ + 1} {money(tp)} ({pa(tp)}) · cierra {part*100:.0f}% · {TP_R[i_]:g}R")
-        if extra.get("htf_tp"):
-            t_, lvl_ = extra["htf_tp"]
-            lines.append(f"   🧲 Tendencial de {t_} en {money(lvl_)} ({pa(lvl_)}): posible freno")
+            lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
         lines.append(bar)
+        if lim:
+            lines += [f"💲 Ahora {money(e1)} · <b>solo límite</b>",
+                      f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2} ({W[1]*100:.0f}%)",
+                      f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3} ({W[2]*100:.0f}%)"]
+        else:
+            lines += [f"💰 E1 {money(e1)} · {q1} ({W[0]*100:.0f}%)",
+                      f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2} ({W[1]*100:.0f}%)",
+                      f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3} ({W[2]*100:.0f}%)"]
+        lines += [f"⚖️ Medio {money(avg_all)} · ⚡<b>{ev['lev']}x</b> · margen ${margin:,.0f}",
+                  f"🛑 SL {money(ev['sl'])} ({pa(ev['sl'])}) · <b>−${risk:,.0f}</b>",
+                  f"🎯 TP {' · '.join(fmt(t) for t in ev['tps'])}",
+                  f"     ({' · '.join(pa(t) for t in ev['tps'])})",
+                  bar]
+        ctx_l = []
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
-            lines.append(f"📈 Tendencial: {' '.join(t + ('▲' if up_ else '▼') for t, up_ in extra['dirs'])} · <b>{fav}/{len(extra['dirs'])}</b> a favor")
-        lines.append(wr_line(extra.get("hist")).replace("Winrate:", f"Winrate {c} {tf}:"))
-        if extra.get("conf"):
-            lines.append(f"🔥 También {s} activo en: {' · '.join(extra['conf'])}")
-        if extra.get("same"):
-            lines.append(f"⚠️ Ya tienes {c} abierta en {', '.join(extra['same'])} (en Bitunix se suman)")
+            ctx_l.append(f"📈 {fav}/{len(extra['dirs'])} TF a favor")
+        h = extra.get("hist")
+        ctx_l.append("🏆 sin historial" if not h or h.get("n", 0) < 5 else f"🏆 {wr_dot(h)} {h['wr']:.0f}% ({h['n']}) {h['avg']:+.2f}R")
         if "open_n" in extra:
-            n_open = extra.get("open_n", 0) + 1
-            lines.append(f"🧯 Operaciones abiertas con esta: {n_open}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else ""))
-        tips = ["E2/E3 como órdenes límite"]
-        if lim:
-            tips.append("si toca TP1 sin llenarse, cancela")
-        if tf in BE_TFS:
-            tips.append("en TP1 mueve el SL a la entrada")
-        tips.append("si llega ⚠️ debilidad, asegura")
-        lines += [bar, "📋 <i>" + " · ".join(tips) + "</i>"]
+            ctx_l.append(f"🧯 {extra.get('open_n', 0) + 1}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else "") + " abiertas")
+        lines.append(" · ".join(ctx_l))
+        if extra.get("conf"):
+            lines.append(f"🔥 También {s}: {' · '.join(extra['conf'])}")
+        if extra.get("same"):
+            lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
+        tips = ["E2/E3 límite"] + (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
+        lines.append("📋 <i>" + " · ".join(tips) + "</i>")
         return "\n".join(lines)
     hdr = f"{link} · {icon} <b>{s}</b>"
     if k == "FILL":
@@ -751,7 +740,7 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     lines = [f"{'🏁' if pnl >= 0 else '🩸'} <b>OPERACIÓN CERRADA · {'GANADA' if pnl >= 0 else 'PERDIDA'}</b>", hdr,
              f"📌 Motivo: {res}" + (f" · salida {money(ev['price'])}" if ev.get("price") else ""),
              f"{'💰' if pnl >= 0 else '🩸'} Resultado: <b>{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}</b> ({ev['r']:+.2f} R)",
-             "", "⚠️ <i>Esta operación ya cerró. No es posible entrar.</i>", "<i>Espera la próxima señal</i> 🚢"]
+             "<i>Operación terminada · espera la próxima señal</i> 🚢"]
     return "\n".join(lines)
 
 
@@ -1399,50 +1388,37 @@ def dirs_line(sym, ctx, tfs=CONF_TFS):
 
 
 def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
-    """v5.0: dirección en grande, qué significa, plan de la señal más reciente y detalle de cada temporalidad."""
-    s, icon, dir_w = ("LONG", "🟢", "COMPRA") if side == 1 else ("SHORT", "🔴", "VENTA")
+    """v5.1: compacta: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
+    s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
     c_ = coin(sym)
     fav = ups if side == 1 else n - ups
     c = ctx[(sym, newest)]
     T = c["T"]
-    pct = lambda x: f"{(x - T['e1']) / T['e1'] * 100:+.2f}%"
     age = max(0, int((time.time() * 1000 - c["t_open"]) // 60_000))
     lev = min(T["lev"], TRADFI_MAX_LEV) if tradfi_kind(sym) else T["lev"]
     link = f"<a href=\"{chart_url(sym, newest)}\">{sym}.P</a>"
-    bar = "━━━━━━━━━━━━━━━"
-    lines = [f"🔥{icon} <b>CONFLUENCIA {s} ({dir_w}) · {c_}</b> {icon}🔥",
-             f"{link} · <b>{len(tfs)} temporalidades</b> con {s} activo a la vez",
-             f"🧭 <i>Varias temporalidades dan {dir_w} al mismo tiempo: la señal es más fuerte que una sola.</i>",
-             bar, f"📈 Tendencial ({fav}/{n} a favor del {s}):", f"   {dirs_line(sym, ctx)}",
-             bar, f"🆕 <b>PLAN · señal más reciente: {newest}</b> · ⭐ {T['q']}/3 · hace {age} min"]
     qty = T.get("qty") or [0, 0, 0]
-    ws = [qq * ee for qq, ee in zip(qty, (T["e1"], T["e2"], T["e3"]))]
-    avg_c = sum(ws) / sum(qty) if sum(qty) > 0 else T["e1"]   # v5.0.1: precio medio planeado (SL/TP en % desde ahí)
-    pa = lambda x: f"{side * (x - avg_c) / avg_c * 100:+.2f}%"
+    avg_c = sum(q * e for q, e in zip(qty, (T["e1"], T["e2"], T["e3"]))) / sum(qty) if sum(qty) > 0 else T["e1"]
+    pa = lambda x: f"{side * (x - avg_c) / avg_c * 100:+.1f}%"
+    risk = st.get("capital", 0) * st.get("risk", 0) / 100 * scale
+    bar = "━━━━━━━━━━━━"
+    lines = [f"🔥{icon} <b>CONFLUENCIA {s} · {c_}</b>",
+             f"{link} · <b>{len(tfs)} TF en {s}</b> · Tendencial {fav}/{n} a favor",
+             bar, f"🆕 Señal {newest} · {T['q']}/3 · hace {age} min"]
     if T["pos"] == 0:
-        lines += [f"   Solo órdenes LÍMITE (no entres a mercado):",
-                  f"   E2 {money(T['e2'])} ({pct(T['e2'])}) · {fq(qty[1] * scale)} {c_}",
-                  f"   E3 {money(T['e3'])} ({pct(T['e3'])}) · {fq(qty[2] * scale)} {c_}"]
+        lines.append(f"📥 Límite E2 {money(T['e2'])} ({fq(qty[1] * scale)}) · E3 {money(T['e3'])} ({fq(qty[2] * scale)})")
     else:
-        lines += [f"   E1 mercado {money(T['e1'])} · {fq(qty[0] * scale)} {c_}",
-                  f"   E2 límite {money(T['e2'])} ({pct(T['e2'])}) · {fq(qty[1] * scale)} {c_}",
-                  f"   E3 límite {money(T['e3'])} ({pct(T['e3'])}) · {fq(qty[2] * scale)} {c_}"]
-    risk = st.get("capital", 0) * st.get("risk", 0) / 100 * scale   # el tamaño se calcula para perder exactamente esto en el SL
-    lines.append(f"🛑 SL {money(T['sl'])} ({pa(T['sl'])} desde tu entrada media)" + (f" → pierdes ${risk:,.2f}" if risk else "") + f" · ⚡ <b>{lev}x</b>")
-    for i_, tp in enumerate(T["tps"]):
-        lines.append(f"🎯 TP{i_ + 1} {money(tp)} ({pa(tp)})" + (" ✓ ya tocado" if T.get("tp", 0) > i_ else ""))
-    lines += [bar, "📋 <b>Detalle por temporalidad</b>"]
+        lines.append(f"💰 E1 {money(T['e1'])} ({fq(qty[0] * scale)}) · E2 {fmt(T['e2'])} ({fq(qty[1] * scale)}) · E3 {fmt(T['e3'])} ({fq(qty[2] * scale)})")
+    lines += [f"🛑 SL {money(T['sl'])} ({pa(T['sl'])})" + (f" · −${risk:,.0f}" if risk else "") + f" · ⚡{lev}x",
+              f"🎯 TP {' · '.join(fmt(t) for t in T['tps'])}" + (" (TP1 ✓)" if T.get("tp") else ""), bar]
+    det = []
     for t in tfs:
         Tt = ctx[(sym, t)]["T"]
         h = hist_stats(st, f"{sym}_{t}")
-        est = "esperando E2 (límite)" if Tt["pos"] == 0 else f"TP{Tt['tp']} ✓" if Tt.get("tp") else "en curso"
-        wr = "sin historial" if h["n"] < 5 else f"WR {h['wr']:.0f}% {wr_dot(h)}"
-        lines.append(f"   {icon} {t}: {s} {Tt['q']}/3 · entrada {money(Tt['e1'])} · {est} · {wr}")
-    lines.append(bar)
-    if len(tfs) >= CONF_MIN:
-        lines.append("📊 <i>Backtest: con 3+ temporalidades a la vez el resultado mejora (factor 1.1-1.2). Usa siempre el SL.</i>")
-    else:
-        lines.append(f"₿ <i>Vigilancia de {c_}: solo 2 temporalidades, tómalo como contexto, no como entrada fuerte.</i>")
+        est = "límite" if Tt["pos"] == 0 else f"TP{Tt['tp']}✓" if Tt.get("tp") else "en curso"
+        det.append(f"{t} {Tt['q']}/3 {est}" + ("" if h["n"] < 5 else f" {h['wr']:.0f}%"))
+    lines.append("📋 " + " · ".join(det))
+    lines.append("📊 <i>3+ TF a la vez: el backtest gana más. Usa SL.</i>" if len(tfs) >= CONF_MIN else f"₿ <i>{c_}: solo 2 TF, tómalo como contexto.</i>")
     return "\n".join(lines)
 
 
