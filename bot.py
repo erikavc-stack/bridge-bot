@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.1 (misma lógica que el indicador Bridge Táctico v9.0 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.2 (misma lógica que el indicador Bridge Táctico v9.2 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.1"
+VERSION = "5.2"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -687,8 +687,7 @@ def message(sym, tf, ev, extra=None, scale=1.0):
                       f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3} ({W[2]*100:.0f}%)"]
         lines += [f"⚖️ Medio {money(avg_all)} · ⚡<b>{ev['lev']}x</b> · margen ${margin:,.0f}",
                   f"🛑 SL {money(ev['sl'])} ({pa(ev['sl'])}) · <b>−${risk:,.0f}</b>",
-                  f"🎯 TP {' · '.join(fmt(t) for t in ev['tps'])}",
-                  f"     ({' · '.join(pa(t) for t in ev['tps'])})",
+                  *[f"🎯 TP{k} {money(t)} ({pa(t)})" for k, t in enumerate(ev['tps'], 1)],
                   bar]
         ctx_l = []
         if extra.get("dirs"):
@@ -1388,7 +1387,7 @@ def dirs_line(sym, ctx, tfs=CONF_TFS):
 
 
 def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
-    """v5.1: compacta: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
+    """v5.2: compacta: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
     s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
     c_ = coin(sym)
     fav = ups if side == 1 else n - ups
@@ -1405,12 +1404,15 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
     lines = [f"🔥{icon} <b>CONFLUENCIA {s} · {c_}</b>",
              f"{link} · <b>{len(tfs)} TF en {s}</b> · Tendencial {fav}/{n} a favor",
              bar, f"🆕 Señal {newest} · {T['q']}/3 · hace {age} min"]
-    if T["pos"] == 0:
-        lines.append(f"📥 Límite E2 {money(T['e2'])} ({fq(qty[1] * scale)}) · E3 {money(T['e3'])} ({fq(qty[2] * scale)})")
-    else:
-        lines.append(f"💰 E1 {money(T['e1'])} ({fq(qty[0] * scale)}) · E2 {fmt(T['e2'])} ({fq(qty[1] * scale)}) · E3 {fmt(T['e3'])} ({fq(qty[2] * scale)})")
-    lines += [f"🛑 SL {money(T['sl'])} ({pa(T['sl'])})" + (f" · −${risk:,.0f}" if risk else "") + f" · ⚡{lev}x",
-              f"🎯 TP {' · '.join(fmt(t) for t in T['tps'])}" + (" (TP1 ✓)" if T.get("tp") else ""), bar]
+    # v5.2: entradas y TP en vertical, con ✓ cuando ya se tocaron
+    fl = T.get("fills", 1)
+    if qty[0] > 0:
+        lines.append(f"💰 E1 {money(T['e1'])} · {fq(qty[0] * scale)}" + (" ✓" if T["pos"] > 0 else ""))
+    lines.append(f"📥 E2 {money(T['e2'])} · {fq(qty[1] * scale)}" + (" ✓" if fl >= 2 else ""))
+    lines.append(f"📥 E3 {money(T['e3'])} · {fq(qty[2] * scale)}" + (" ✓" if fl >= 3 else ""))
+    lines.append(f"🛑 SL {money(T['sl'])} ({pa(T['sl'])})" + (f" · −${risk:,.0f}" if risk else "") + f" · ⚡{lev}x")
+    lines += [f"🎯 TP{k} {money(t)} ({pa(t)})" + (" ✓" if T.get("tp", 0) >= k else "") for k, t in enumerate(T["tps"], 1)]
+    lines.append(bar)
     det = []
     for t in tfs:
         Tt = ctx[(sym, t)]["T"]
