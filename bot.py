@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.3 (misma lógica que el indicador Bridge Táctico v9.4 · CALIDAD A en 2h/4h/8h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.4 (misma lógica que el indicador Bridge Táctico v9.6 · CALIDAD A en 2h/4h/8h sin fin de semana · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.3"
+VERSION = "5.4"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -440,6 +440,10 @@ MAJ_FLIP_TFS = ("1h", "4h", "1d")
 GRADE_HTF = {"1m": "15m", "3m": "15m", "5m": "1h", "15m": "1h", "1h": "4h", "2h": "8h", "4h": "1d", "8h": "1d"}
 QA_TFS = tuple(t for t in os.environ.get("QA_TFS", "2h,4h,8h").split(",") if t in GRADE_HTF)
 QA_REF = "BTCUSDT"
+# v5.4: en esas mismas temporalidades no se abren señales en velas de fin de semana (sábado/domingo UTC, poca liquidez).
+# Backtest 30 monedas 2h+4h+8h: factor 1.38 → 1.51 y más ganancia total (97.6 R → 111.3 R), 23 de 30 monedas en positivo.
+# 1h pierde en el backtest con cualquier filtro probado (mejor caso factor 0.96): se avisa en el mensaje.
+WEAK_TF = {"1h": "1h pierde en el backtest (factor 0.9): mejor 2h/4h/8h"}
 
 
 def tf_mode(tf, st):
@@ -456,7 +460,7 @@ def tf_mode(tf, st):
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia exacta del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False):
+def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False):
     """Señales y gestión vela a vela. dirs = Tendencial de temporalidades mayores que debe ir a favor.
     W[0] == 0 → modo límite: no se entra a mercado; si el precio llega al TP1 sin llenar E2, la orden se cancela.
     Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta.
@@ -490,7 +494,8 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
         score = 1 + int(c2) + int(c3)
         ok_ema = (not USE_EMA) or (b["c"] > e200[i] if up else b["c"] < e200[i])
         ok_htf = all(ds[i] == side for ds in dirs) if dirs else True
-        sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_htf
+        ok_wk = not (no_wknd and time.gmtime(b["ct"] / 1000).tm_wday >= 5)  # v5.4: sin entradas en velas de sábado/domingo (UTC)
+        sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_htf and ok_wk
         if sig:
             fired = True
         new_side = side if sig else 0
@@ -680,7 +685,7 @@ def hm_local(ms):
 
 
 def message(sym, tf, ev, extra=None, scale=1.0):
-    """Mensajes con el formato del Radar de Aurolo. scale = riesgo de este usuario / riesgo del cálculo."""
+    """Mensajes de Telegram. scale = riesgo de este usuario / riesgo del cálculo."""
     extra = extra or {}
     s = "LONG" if ev["side"] == 1 else "SHORT"
     icon = "🟢" if ev["side"] == 1 else "🔴"
@@ -733,6 +738,8 @@ def message(sym, tf, ev, extra=None, scale=1.0):
             lines.append(f"🔥 También {s}: {' · '.join(extra['conf'])}")
         if extra.get("same"):
             lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
+        if tf in WEAK_TF:
+            lines.append(f"⚠️ <i>{WEAK_TF[tf]}</i>")
         tips = (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
         if tips:
             lines.append("📋 <i>" + " · ".join(tips) + "</i>")
@@ -902,6 +909,12 @@ def load_state():
         st["v31"] = True
     st.setdefault("offset", 0)
     st.setdefault("calidad", "A")
+    if not st.get("v54"):  # v5.4: 2h/4h/8h sin fin de semana → winrate nuevo para esas temporalidades
+        for p in list(st.get("hist", {})):
+            if p.endswith(tuple("_" + t for t in QA_TFS)):
+                del st["hist"][p]
+        st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in QA_TFS))]
+        st["v54"] = True
     if not st.get("v53"):  # v5.3: 2h/4h/8h solo calidad A → winrate nuevo para esas temporalidades
         for p in list(st.get("hist", {})):
             if p.endswith(tuple("_" + t for t in QA_TFS)):
@@ -1083,7 +1096,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/top 30 → además vigila las 30 monedas con más volumen (0 = solo favoritas)\n"
               "/limite si|no → 5m y 4h con órdenes límite (recomendado)\n"
               "/h4 si|no → modo preciso 1m/3m (a favor de 15m y 4h)\n"
-              "/calidad A|todas → 2h/4h/8h solo señales calidad A (recomendado)\n"
+              "/calidad A|todas → 2h/4h/8h solo señales calidad A y sin fin de semana (recomendado)\n"
               "/radar cada 30 · /radar off → radar automático\n"
               "/nube → cómo funciona el respaldo en GitHub\n"
               "/actualizar → el servidor instala la última versión\n\n"
@@ -1251,7 +1264,7 @@ def command(token, owner, st, ctx, cid, msg):
                     if p.endswith(tuple("_" + t for t in QA_TFS)):
                         del st["hist"][p]
                 st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in QA_TFS))]
-        reply("⭐ Calidad en " + ", ".join(QA_TFS) + ": " + ("<b>solo A</b> (Tendencial mayor y BTC a favor · backtest: factor 1.41 vs 0.75)" if st.get("calidad", "A") == "A" else "todas las señales") + "\n/calidad A · /calidad todas")
+        reply("⭐ Calidad en " + ", ".join(QA_TFS) + ": " + ("<b>solo A</b> (Tendencial mayor y BTC a favor · sin fin de semana · backtest: factor 1.51 vs 0.75)" if st.get("calidad", "A") == "A" else "todas las señales") + "\n/calidad A · /calidad todas")
     elif cmd in ("/btc", "/eth"):
         reply(majors_report(st, ctx))
     elif cmd in ("/stats", "/diario"):
@@ -1727,7 +1740,7 @@ def open_extras(sym, tf, ev, ctx):
     return {"dirs": dirs, "htf_tp": tgt}
 
 
-# ----------------------------- MONEDAS: favoritas + las de más volumen (como el radar de Aurolo) -----------------------------
+# ----------------------------- MONEDAS: favoritas + las de más volumen -----------------------------
 _top_cache = {"t": 0, "list": []}
 EXCLUDE = {"USDCUSDT", "BTCDOMUSDT", "DEFIUSDT", "FDUSDUSDT", "TUSDUSDT"}
 
@@ -1773,7 +1786,7 @@ def compute(sym, tf, st, want=None):
     gd = grade_dirs(sym, d, tf)
     qa = st.get("calidad", "A") == "A" and tf in QA_TFS and bool(gd)
     dirs = ([dir_series(sym, d, h) for h in m["htf"]] + (gd if qa else [])) or None
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"])
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym))
     for ev in events:
         if ev["kind"] == "OPEN":
             ev["g"], ev["gc"] = grade_at(gd, ev["bar"], ev["side"])
@@ -1785,7 +1798,7 @@ def compute(sym, tf, st, want=None):
             dl = fetch_long(sym, tf, 3000)
             dl_g = grade_dirs(sym, dl, tf, 1500) if qa else []
             dl_dirs = ([dir_series(sym, dl, h, 1500) for h in m["htf"]] + dl_g) or None
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"])
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym))
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3), e["side"], e["q"]) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
