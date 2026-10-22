@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.2 (misma lógica que el indicador Bridge Táctico v9.2 · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.3 (misma lógica que el indicador Bridge Táctico v9.4 · CALIDAD A en 2h/4h/8h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.2"
+VERSION = "5.3"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -396,6 +396,31 @@ def dir4_series(sym, d):
     return dir_series(sym, d, "4h")
 
 
+def grade_dirs(sym, d, tf, limit=499):
+    """v5.3: [Tendencial mayor de la moneda, Tendencial de BTC en esa temporalidad] alineadas con las velas d."""
+    gh = GRADE_HTF.get(tf)
+    if not gh:
+        return []
+    try:
+        out = [dir_series(sym, d, gh, limit)]
+        if sym != QA_REF and not tradfi_kind(sym):
+            out.append(dir_series(QA_REF, d, gh, limit))
+        return out
+    except Exception as e:
+        print(f"⚠️ calidad {sym} {tf}: {e}")
+        return []
+
+
+def grade_at(gd, i, side):
+    """Calidad A (todo a favor) · B (una) · C (ninguna) y el detalle [moneda, BTC]."""
+    if not gd:
+        return None, []
+    ok = [ds[i] == side for ds in gd]
+    n = sum(ok)
+    g = "A" if n == len(ok) else "B" if n else "C"
+    return g, ok
+
+
 # ----------------------------- MODO DE CADA TEMPORALIDAD (igual que el indicador v8 en modo automático) -----------------------------
 LIM_W = (0.0, 0.40, 0.60)   # modo límite: sin entrada a mercado · orden límite en E2 (40 %) y E3 (60 %)
 BE_TFS = tuple(t for t in os.environ.get("BE_TFS", "15m,4h,1d").split(",") if t)   # temporalidades con SL a la entrada tras TP1
@@ -409,6 +434,12 @@ CONF_MIN = int(os.environ.get("CONF_MIN", "3"))   # temporalidades con señal ac
 CONF_COOL = 4 * 3_600_000                          # el mismo aviso no se repite antes de 4 h (salvo que sumen más temporalidades)
 MAJORS = ("BTCUSDT", "ETHUSDT")                   # se siguen de cerca: todas las temporalidades, aviso desde 2 y cambios de tendencia
 MAJ_FLIP_TFS = ("1h", "4h", "1d")
+# v5.3 · CALIDAD: la Tendencial de la temporalidad mayor y la de BTC en esa misma temporalidad a favor de la señal.
+# Backtest 30 monedas (2h/4h/8h, comisiones incluidas): calidad A factor 1.41 · 51 % acierto (21 de 30 monedas en positivo)
+# frente a 0.75 · 37 % del resto. En 15m/1h no mejora (ahí solo se muestra). Filtrar por el winrate pasado de cada moneda NO ayudó.
+GRADE_HTF = {"1m": "15m", "3m": "15m", "5m": "1h", "15m": "1h", "1h": "4h", "2h": "8h", "4h": "1d", "8h": "1d"}
+QA_TFS = tuple(t for t in os.environ.get("QA_TFS", "2h,4h,8h").split(",") if t in GRADE_HTF)
+QA_REF = "BTCUSDT"
 
 
 def tf_mode(tf, st):
@@ -656,7 +687,7 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     pair, TF = sym + ".P", tf.upper()
     link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     k = ev["kind"]
-    if k == "OPEN":  # v5.1: detallado pero compacto (~13 líneas)
+    if k == "OPEN":  # v5.3: detallado y compacto · winrate y calidad siempre visibles
         e1 = ev["price"]
         lim = ev.get("limit")
         c = coin(sym)
@@ -669,32 +700,32 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         risk = ev["risk"] * scale
         cc = ev.get("c") or (True, False, False)
         why = " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip(("Tend", "Mom", "WT"), cc))
+        g, gc = ev.get("g"), ev.get("gc") or []
+        if gc:
+            why += " · " + " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip((GRADE_HTF.get(tf, ""), "BTC"), gc))
+        gtx = "" if not g else " · ⭐ <b>Calidad A</b>" if g == "A" else f" · Calidad {g}"
         bar = "━━━━━━━━━━━━"
-        lines = [f"{icon} <b>{s} · {c} {tf}</b> · {ev['q']}/3" + (" ⭐" if ev["q"] == 3 else "") + (f" · {extra['hm']}" if extra.get("hm") else ""),
-                 f"{link} · {why}"]
+        lines = [f"{icon} <b>{s} · {c} {tf}</b> · {ev['q']}/3{gtx}" + (f" · {extra['hm']}" if extra.get("hm") else ""),
+                 f"{link} · {why}",
+                 extra.get("wr") or "🏆 Winrate: calculando historial…"]
         if extra.get("late"):
             lines.append(f"⏱ <i>de hace {extra['late']} min" + (f" · ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
         if extra.get("tradfi"):
             lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
         lines.append(bar)
         if lim:
-            lines += [f"💲 Ahora {money(e1)} · <b>solo límite</b>",
-                      f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2} ({W[1]*100:.0f}%)",
-                      f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3} ({W[2]*100:.0f}%)"]
+            lines.append(f"💲 Ahora {money(e1)} · <b>solo órdenes límite</b>")
         else:
-            lines += [f"💰 E1 {money(e1)} · {q1} ({W[0]*100:.0f}%)",
-                      f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2} ({W[1]*100:.0f}%)",
-                      f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3} ({W[2]*100:.0f}%)"]
-        lines += [f"⚖️ Medio {money(avg_all)} · ⚡<b>{ev['lev']}x</b> · margen ${margin:,.0f}",
-                  f"🛑 SL {money(ev['sl'])} ({pa(ev['sl'])}) · <b>−${risk:,.0f}</b>",
+            lines.append(f"💰 E1 {money(e1)} · {q1}")
+        lines += [f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2}",
+                  f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3}",
+                  f"🛑 SL {money(ev['sl'])} ({pa(ev['sl'])}) · <b>−${risk:,.0f}</b> · ⚡<b>{ev['lev']}x</b>",
                   *[f"🎯 TP{k} {money(t)} ({pa(t)})" for k, t in enumerate(ev['tps'], 1)],
                   bar]
-        ctx_l = []
+        ctx_l = [f"⚖️ Medio {money(avg_all)} · margen ${margin:,.0f}"]
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
             ctx_l.append(f"📈 {fav}/{len(extra['dirs'])} TF a favor")
-        h = extra.get("hist")
-        ctx_l.append("🏆 sin historial" if not h or h.get("n", 0) < 5 else f"🏆 {wr_dot(h)} {h['wr']:.0f}% ({h['n']}) {h['avg']:+.2f}R")
         if "open_n" in extra:
             ctx_l.append(f"🧯 {extra.get('open_n', 0) + 1}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else "") + " abiertas")
         lines.append(" · ".join(ctx_l))
@@ -702,8 +733,9 @@ def message(sym, tf, ev, extra=None, scale=1.0):
             lines.append(f"🔥 También {s}: {' · '.join(extra['conf'])}")
         if extra.get("same"):
             lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
-        tips = ["E2/E3 límite"] + (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
-        lines.append("📋 <i>" + " · ".join(tips) + "</i>")
+        tips = (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
+        if tips:
+            lines.append("📋 <i>" + " · ".join(tips) + "</i>")
         return "\n".join(lines)
     hdr = f"{link} · {icon} <b>{s}</b>"
     if k == "FILL":
@@ -869,6 +901,13 @@ def load_state():
             st["tfs"].append("1h")
         st["v31"] = True
     st.setdefault("offset", 0)
+    st.setdefault("calidad", "A")
+    if not st.get("v53"):  # v5.3: 2h/4h/8h solo calidad A → winrate nuevo para esas temporalidades
+        for p in list(st.get("hist", {})):
+            if p.endswith(tuple("_" + t for t in QA_TFS)):
+                del st["hist"][p]
+        st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in QA_TFS))]
+        st["v53"] = True
     st.setdefault("seen_pairs", [])
     st.setdefault("trades", {})
     st.setdefault("live", {})
@@ -1020,7 +1059,8 @@ def settings_line(st, uid="owner"):
             f"🔥 Confluencias: {'sí' if u.get('conf', True) else 'no'} · ₿ BTC/ETH de cerca: {'sí' if u.get('maj', True) else 'no'}")
     if uid == "owner":
         line += (f"\n🛡 SL mínimo {MIN_DIST:g}% · 📥 modo límite 5m/4h: {'sí' if st.get('limit', True) else 'no'}"
-                 f" · 🎯 modo preciso 1m/3m: {'sí' if st['h4'] else 'no'} · monedas: favoritas + top {st.get('top', 0)}")
+                 f" · 🎯 modo preciso 1m/3m: {'sí' if st['h4'] else 'no'} · ⭐ calidad 2h/4h/8h: {'solo A' if st.get('calidad', 'A') == 'A' else 'todas'}"
+                 f" · monedas: favoritas + top {st.get('top', 0)}")
     return line
 
 
@@ -1043,6 +1083,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/top 30 → además vigila las 30 monedas con más volumen (0 = solo favoritas)\n"
               "/limite si|no → 5m y 4h con órdenes límite (recomendado)\n"
               "/h4 si|no → modo preciso 1m/3m (a favor de 15m y 4h)\n"
+              "/calidad A|todas → 2h/4h/8h solo señales calidad A (recomendado)\n"
               "/radar cada 30 · /radar off → radar automático\n"
               "/nube → cómo funciona el respaldo en GitHub\n"
               "/actualizar → el servidor instala la última versión\n\n"
@@ -1201,6 +1242,16 @@ def command(token, owner, st, ctx, cid, msg):
         reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
+    elif cmd == "/calidad" and is_owner:
+        if args:
+            new = "A" if args[0].lower() in ("a", "si", "sí", "on", "1") else "todas"
+            if new != st.get("calidad", "A"):
+                st["calidad"] = new
+                for p in list(st.get("hist", {})):  # cambia la regla: winrate nuevo de 2h/4h/8h
+                    if p.endswith(tuple("_" + t for t in QA_TFS)):
+                        del st["hist"][p]
+                st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in QA_TFS))]
+        reply("⭐ Calidad en " + ", ".join(QA_TFS) + ": " + ("<b>solo A</b> (Tendencial mayor y BTC a favor · backtest: factor 1.41 vs 0.75)" if st.get("calidad", "A") == "A" else "todas las señales") + "\n/calidad A · /calidad todas")
     elif cmd in ("/btc", "/eth"):
         reply(majors_report(st, ctx))
     elif cmd in ("/stats", "/diario"):
@@ -1358,12 +1409,34 @@ def radar_report(st, ctx, uid="owner"):
 
 
 # ----------------------------- PROCESO -----------------------------
-def hist_stats(st, pair):
-    h = st.get("hist", {}).get(pair, {})
-    n = len(h)
+def _stats(vals):
+    n = len(vals)
     if not n:
         return {"n": 0, "wr": 0.0, "avg": 0.0}
-    return {"n": n, "wr": 100.0 * sum(v[0] for v in h.values()) / n, "avg": sum(v[1] for v in h.values()) / n}
+    return {"n": n, "wr": 100.0 * sum(v[0] for v in vals) / n, "avg": sum(v[1] for v in vals) / n}
+
+
+def hist_stats(st, pair, side=None):
+    vals = list(st.get("hist", {}).get(pair, {}).values())
+    if side:
+        vals = [v for v in vals if len(v) > 2 and v[2] == side]
+    return _stats(vals)
+
+
+def tf_stats(st, tf):
+    """v5.3: winrate de una temporalidad con TODAS las monedas (backtest de 3000 velas + operaciones reales)."""
+    return _stats([v for p, h in st.get("hist", {}).items() if p.endswith("_" + tf) for v in h.values()])
+
+
+def wr_text(st, sym, tf):
+    """🏆 Winrate 2h: 51 % (547 ops) · ETH: 58 % (24)"""
+    t, h = tf_stats(st, tf), hist_stats(st, f"{sym}_{tf}")
+    parts = []
+    if t["n"] >= 10:
+        parts.append(f"<b>Winrate {tf}: {t['wr']:.0f}%</b> ({t['n']} ops)")
+    if h["n"] >= 5:
+        parts.append(f"{coin(sym)}: {h['wr']:.0f}% ({h['n']})")
+    return "🏆 " + (" · ".join(parts) if parts else "Winrate: calculando historial…")
 
 
 # ----------------------------- CONFLUENCIAS Y BTC/ETH (v4.9) -----------------------------
@@ -1387,7 +1460,7 @@ def dirs_line(sym, ctx, tfs=CONF_TFS):
 
 
 def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
-    """v5.2: compacta: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
+    """v5.3: compacta, con winrate de cada temporalidad y calidad: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
     s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
     c_ = coin(sym)
     fav = ups if side == 1 else n - ups
@@ -1401,9 +1474,16 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
     pa = lambda x: f"{side * (x - avg_c) / avg_c * 100:+.1f}%"
     risk = st.get("capital", 0) * st.get("risk", 0) / 100 * scale
     bar = "━━━━━━━━━━━━"
+    wrs = []
+    for t in tfs:
+        h, tt = hist_stats(st, f"{sym}_{t}"), tf_stats(st, t)
+        x = h if h["n"] >= 5 else tt
+        wrs.append(f"{t} {x['wr']:.0f}%" if x["n"] >= 5 else f"{t} —")
+    g = T.get("g")
     lines = [f"🔥{icon} <b>CONFLUENCIA {s} · {c_}</b>",
              f"{link} · <b>{len(tfs)} TF en {s}</b> · Tendencial {fav}/{n} a favor",
-             bar, f"🆕 Señal {newest} · {T['q']}/3 · hace {age} min"]
+             "🏆 <b>Winrate</b> " + " · ".join(wrs),
+             bar, f"🆕 Señal {newest} · {T['q']}/3" + (" · ⭐ <b>Calidad A</b>" if g == "A" else f" · Calidad {g}" if g else "") + f" · hace {age} min"]
     # v5.2: entradas y TP en vertical, con ✓ cuando ya se tocaron
     fl = T.get("fills", 1)
     if qty[0] > 0:
@@ -1418,7 +1498,7 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
         Tt = ctx[(sym, t)]["T"]
         h = hist_stats(st, f"{sym}_{t}")
         est = "límite" if Tt["pos"] == 0 else f"TP{Tt['tp']}✓" if Tt.get("tp") else "en curso"
-        det.append(f"{t} {Tt['q']}/3 {est}" + ("" if h["n"] < 5 else f" {h['wr']:.0f}%"))
+        det.append(f"{t} {Tt['q']}/3 {est}" + (" A" if Tt.get("g") == "A" else ""))
     lines.append("📋 " + " · ".join(det))
     lines.append("📊 <i>3+ TF a la vez: el backtest gana más. Usa SL.</i>" if len(tfs) >= CONF_MIN else f"₿ <i>{c_}: solo 2 TF, tómalo como contexto.</i>")
     return "\n".join(lines)
@@ -1690,15 +1770,23 @@ def compute(sym, tf, st, want=None):
         _last1m[sym] = (time.time(), d[-5:])
     I = indicators(d)
     m = tf_mode(tf, st)
-    dirs = [dir_series(sym, d, h) for h in m["htf"]] or None
+    gd = grade_dirs(sym, d, tf)
+    qa = st.get("calidad", "A") == "A" and tf in QA_TFS and bool(gd)
+    dirs = ([dir_series(sym, d, h) for h in m["htf"]] + (gd if qa else [])) or None
     events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"])
+    for ev in events:
+        if ev["kind"] == "OPEN":
+            ev["g"], ev["gc"] = grade_at(gd, ev["bar"], ev["side"])
+    if T:
+        T["g"], T["gc"] = grade_at(gd, T["bar"], T["side"])
     seed = None
     if pair not in st.get("hist_seeded", []) and tf in want:  # la primera vez: winrate con un historial largo
         try:
             dl = fetch_long(sym, tf, 3000)
-            dl_dirs = [dir_series(sym, dl, h, 1500) for h in m["htf"]] or None
+            dl_g = grade_dirs(sym, dl, tf, 1500) if qa else []
+            dl_dirs = ([dir_series(sym, dl, h, 1500) for h in m["htf"]] + dl_g) or None
             evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"])
-            seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3)) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
+            seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3), e["side"], e["q"]) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
     return dict(sym=sym, tf=tf, d=d, up=I["dir"][-1] < 0, st=I["st"][-1], events=events, T=T, pts=last["pts"], seed=seed)
@@ -1735,12 +1823,12 @@ def apply(res, st, ctx, token, owner, notify=True):
                       "t_open": d[T["bar"]]["ct"] if T else None}
     H = st.setdefault("hist", {}).setdefault(pair, {})
     if res["seed"] is not None:
-        for k, w, r in res["seed"]:
-            H.setdefault(k, [w, r])
+        for k, w, r, *rest in res["seed"]:
+            H.setdefault(k, [w, r] + rest)
         st.setdefault("hist_seeded", []).append(pair)
     for ev in res["events"]:
         if ev["kind"] == "CLOSE" and ev["entry"] >= 250:
-            H[str(d[ev["entry"]]["t"])] = [1 if ev["win"] else 0, round(ev["r"], 3)]
+            H[str(d[ev["entry"]]["t"])] = [1 if ev["win"] else 0, round(ev["r"], 3), ev["side"], ev["q"]]
     if len(H) > 150:
         for k in sorted(H, key=int)[:-150]:
             del H[k]
@@ -1794,7 +1882,7 @@ def apply(res, st, ctx, token, owner, notify=True):
                     continue  # el usuario puso un máximo con /maxops y ya lo alcanzó
                 uids.append(u)  # v4.9.1: llegan todas; si ya tiene esa moneda abierta, el mensaje lo avisa
                 per_user[u] = {"open_n": len(mine), "max_ops": mx, "same": [t2 for _, s2, t2 in mine if s2 == sym]}
-            extra = {"hist": hist_stats(st, pair), "late": int(age // 60_000) if late else 0, "now_px": now_px,
+            extra = {"hist": hist_stats(st, pair), "wr": wr_text(st, sym, tf), "late": int(age // 60_000) if late else 0, "now_px": now_px,
                      "tradfi": bool(kind), "night": stocks_night(kind), "hm": hm_local(d[ev["bar"]]["ct"])}
             extra.update(open_extras(sym, tf, ev, ctx))
             extra["conf"] = [t for t in ALL_TFS if t != tf and ((ctx.get((sym, t)) or {}).get("T") or {}).get("side") == ev["side"]]
