@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.5 (misma lógica que el indicador Bridge Táctico v9.7 · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.6 (misma lógica que el indicador Bridge Táctico v9.8 · TP3 a 1.5 R · aviso de señal repetida · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.5"
+VERSION = "5.6"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -36,7 +36,9 @@ DCA_W = (0.20, 0.30, 0.50)        # E1 20 % · E2 30 % · E3 50 %  (15m y más)
 LOW_W = (0.10, 0.30, 0.60)        # modo preciso 1m/3m: E1 10 % · E2 30 % · E3 60 %
 LOW_MIN_DIST = 0.45               # modo preciso 1m/3m: SL mínimo 0.45 %
 DCA_ATR, SL_ATR = 1.0, 1.0
-TP_R = (0.5, 1.0, 2.0)
+# v5.6: TP3 a 1.5 R (antes 2 R). Backtest 30 monedas 2h+4h+8h: factor 1.74 → 1.80, ganancia 101.6 R → 109.4 R,
+# caída máxima 12.1 R → 9.1 R, llegan a TP3 el 47 % (antes 39 %) y las operaciones duran menos (mediana 64 → 54 velas).
+TP_R = (0.5, 1.0, 1.5)
 TP_SPLIT = (0.40, 0.30, 0.30)
 MAX_LEV, LOSS_MARGIN_PCT = 50, 50.0   # apalancamiento recomendado: si toca el SL pierdes ~50 % del margen
 LEV_STEPS = (5, 10, 15, 20, 25, 30, 40, 50)
@@ -569,6 +571,8 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
             events.append(dict(kind="CLOSE", bar=i, entry=T["bar"], side=T["side"], price=exit_px, q=T["q"], win=pnl_usd > 0, tp=T["tp"],
                                reason=reason, pnl=pnl_usd, r=pnl_usd / risk_usd))
             T = None
+        if T and new_side == T["side"] and not close_now:  # v5.6: nueva señal del mismo lado con la operación abierta: no se abre otra
+            events.append(dict(kind="REPEAT", bar=i, entry=T["bar"], side=T["side"], price=b["c"], tp=T["tp"]))
         if T and i > T["bar"] and T["pos"] > 0 and ((T["side"] == 1 and last_xdn == i) or (T["side"] == -1 and last_xup == i)):
             events.append(dict(kind="WEAK", bar=i, entry=T["bar"], side=T["side"], price=b["c"]))  # debilidad: WaveTrend gira en contra
         if new_side and not T:
@@ -785,6 +789,10 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         return "\n".join(["⛔ <b>STOP LOSS TOCADO</b>", hdr,
                           f"🛟 Precio: {money(ev['price'])}", "", "ℹ️ <i>Si tenías el SL puesto, la operación ya se cerró.</i>",
                           "<i>El resultado en $ llega al cerrar la vela.</i>"])
+    if k == "REPEAT":
+        return "\n".join([f"🔁 <b>SEÑAL REPETIDA · {s}</b>", hdr,
+                          f"💲 Precio: {money(ev['price'])}" + (f" · TP{ev['tp']} ✓ ya tocado" if ev.get("tp") else ""),
+                          "💡 <i>Tu operación sigue abierta: no se abre otra, sigue con la que tienes.</i>"])
     if k == "WKND":
         return "\n".join(["⚠️ <b>CIERRE DE FIN DE SEMANA</b>", hdr, "",
                           "🏛 El mercado real (bolsa / materias primas) cierra pronto hasta el domingo-lunes.",
@@ -928,6 +936,8 @@ def load_state():
     st.setdefault("offset", 0)
     st.setdefault("calidad", "A")
     st.setdefault("confirmar", True)
+    if not st.get("v56"):  # v5.6: TP3 a 1.5 R en todas las temporalidades → winrate nuevo
+        st["hist"], st["hist_seeded"], st["v56"] = {}, [], True
     if not st.get("v55"):  # v5.5: 2h/4h con vela de confirmación → winrate nuevo para esas temporalidades
         for p in list(st.get("hist", {})):
             if p.endswith(tuple("_" + t for t in CONFIRM_TFS)):
@@ -1948,6 +1958,8 @@ def apply(res, st, ctx, token, owner, notify=True):
             tr = trades.get(tid)
             if not tr or tr.get("cancelled") or (tr.get("closed") and ev["kind"] not in ("CANCEL", "CLOSE")):
                 continue  # nadie recibió esa señal (o ya se avisó que se canceló): no se manda un TP suelto
+            if ev["kind"] == "REPEAT" and age > 2 * tfms + 120_000:
+                continue  # aviso de señal repetida viejo (p. ej. al arrancar): no se manda
             if ev["kind"] in ("CANCEL", "CLOSE"):
                 live.pop(tid, None)
                 tr["closed"] = True  # cerrada aunque el mensaje falle: no bloquea la señal nueva de la misma vela
