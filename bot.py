@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.4 (misma lógica que el indicador Bridge Táctico v9.6 · CALIDAD A en 2h/4h/8h sin fin de semana · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v5.5 (misma lógica que el indicador Bridge Táctico v9.7 · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.4"
+VERSION = "5.5"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -444,6 +444,10 @@ QA_REF = "BTCUSDT"
 # Backtest 30 monedas 2h+4h+8h: factor 1.38 → 1.51 y más ganancia total (97.6 R → 111.3 R), 23 de 30 monedas en positivo.
 # 1h pierde en el backtest con cualquier filtro probado (mejor caso factor 0.96): se avisa en el mensaje.
 WEAK_TF = {"1h": "1h pierde en el backtest (factor 0.9): mejor 2h/4h/8h"}
+# v5.5 · VELA DE CONFIRMACIÓN en 2h y 4h: la señal espera a que la vela siguiente cierre a favor (cuerpo a favor y cierre
+# más allá del cierre anterior) y la entrada es al cierre de esa vela. Backtest 30 monedas 2h+4h+8h (8h sin cambio):
+# acierto 51 % → 54 %, factor 1.51 → 1.74, caída máxima 27 R → 12 R, peor racha 20 → 9 pérdidas; ganancia total −9 %.
+CONFIRM_TFS = tuple(t for t in os.environ.get("CONFIRM_TFS", "2h,4h").split(",") if t in QA_TFS)
 
 
 def tf_mode(tf, st):
@@ -460,7 +464,7 @@ def tf_mode(tf, st):
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia exacta del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False):
+def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False, confirm=False):
     """Señales y gestión vela a vela. dirs = Tendencial de temporalidades mayores que debe ir a favor.
     W[0] == 0 → modo límite: no se entra a mercado; si el precio llega al TP1 sin llenar E2, la orden se cancela.
     Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta.
@@ -471,6 +475,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
     last_zone, zone_side, fired = -10**9, 0, False
     last_xup = last_xdn = -10**9
     T = None
+    pend = None  # v5.5: señal en espera de la vela de confirmación (lado, vela, calidad, condiciones)
     last = dict(pts=0, c=(False, False, False))
     risk_usd = capital * risk_pct / 100
     for i in range(30, len(d)):
@@ -498,8 +503,19 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
         sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_htf and ok_wk
         if sig:
             fired = True
-        new_side = side if sig else 0
-        last = dict(pts=score if c1 else 0, c=(c1, c2, c3))
+        sig_q, sig_c = score, (c1, c2, c3)
+        if confirm:  # v5.5: se entra al cierre de la vela siguiente solo si cierra a favor
+            new_side = 0
+            if pend and pend[1] == i - 1:
+                pc = d[i - 1]["c"]
+                if pend[0] == side and ((b["c"] > b["o"] and b["c"] > pc) if side == 1 else (b["c"] < b["o"] and b["c"] < pc)):
+                    new_side, sig_q, sig_c = side, pend[2], pend[3]
+                pend = None
+            if sig:
+                pend = (side, i, score, (c1, c2, c3))
+        else:
+            new_side = side if sig else 0
+        last = dict(pts=score if c1 else 0, c=(c1, c2, c3), pend=bool(pend) and pend[1] == i)
 
         # gestión de la operación abierta
         close_now, exit_px, reason, exit_fee = False, None, "", FEE_TAKER
@@ -570,10 +586,10 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
             notional = risk_usd / worst
             qty = [notional * w / e for w, e in zip(W, (e1, e2, e3))]
             margin = [notional * w / lev for w in W]
-            T = dict(side=s, q=score, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, pos=W[0], fills=1, tp=0,
+            T = dict(side=s, q=sig_q, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, pos=W[0], fills=1, tp=0,
                      real=0.0, remS=1.0, fees=W[0] * FEE_TAKER, notional=notional, lev=lev, qty=qty, margin=margin)
-            events.append(dict(kind="OPEN", bar=i, side=s, price=e1, q=score, sl=sl, tps=tps, e2=e2, e3=e3, lev=lev,
-                               c=(c1, c2, c3), qty=qty, margin=margin, risk=risk_usd, limit=W[0] == 0, w=W))
+            events.append(dict(kind="OPEN", bar=i, side=s, price=e1, q=sig_q, sl=sl, tps=tps, e2=e2, e3=e3, lev=lev,
+                               c=sig_c, qty=qty, margin=margin, risk=risk_usd, limit=W[0] == 0, w=W, cf=confirm))
     return events, T, last
 
 
@@ -708,6 +724,8 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         g, gc = ev.get("g"), ev.get("gc") or []
         if gc:
             why += " · " + " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip((GRADE_HTF.get(tf, ""), "BTC"), gc))
+        if ev.get("cf"):
+            why += " · Vela ✓"
         gtx = "" if not g else " · ⭐ <b>Calidad A</b>" if g == "A" else f" · Calidad {g}"
         bar = "━━━━━━━━━━━━"
         lines = [f"{icon} <b>{s} · {c} {tf}</b> · {ev['q']}/3{gtx}" + (f" · {extra['hm']}" if extra.get("hm") else ""),
@@ -909,6 +927,13 @@ def load_state():
         st["v31"] = True
     st.setdefault("offset", 0)
     st.setdefault("calidad", "A")
+    st.setdefault("confirmar", True)
+    if not st.get("v55"):  # v5.5: 2h/4h con vela de confirmación → winrate nuevo para esas temporalidades
+        for p in list(st.get("hist", {})):
+            if p.endswith(tuple("_" + t for t in CONFIRM_TFS)):
+                del st["hist"][p]
+        st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in CONFIRM_TFS))]
+        st["v55"] = True
     if not st.get("v54"):  # v5.4: 2h/4h/8h sin fin de semana → winrate nuevo para esas temporalidades
         for p in list(st.get("hist", {})):
             if p.endswith(tuple("_" + t for t in QA_TFS)):
@@ -1073,6 +1098,7 @@ def settings_line(st, uid="owner"):
     if uid == "owner":
         line += (f"\n🛡 SL mínimo {MIN_DIST:g}% · 📥 modo límite 5m/4h: {'sí' if st.get('limit', True) else 'no'}"
                  f" · 🎯 modo preciso 1m/3m: {'sí' if st['h4'] else 'no'} · ⭐ calidad 2h/4h/8h: {'solo A' if st.get('calidad', 'A') == 'A' else 'todas'}"
+                 f" · 🕯 confirmación 2h/4h: {'sí' if st.get('confirmar', True) else 'no'}"
                  f" · monedas: favoritas + top {st.get('top', 0)}")
     return line
 
@@ -1097,6 +1123,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/limite si|no → 5m y 4h con órdenes límite (recomendado)\n"
               "/h4 si|no → modo preciso 1m/3m (a favor de 15m y 4h)\n"
               "/calidad A|todas → 2h/4h/8h solo señales calidad A y sin fin de semana (recomendado)\n"
+              "/confirmar si|no → 2h/4h esperan la vela de confirmación (recomendado)\n"
               "/radar cada 30 · /radar off → radar automático\n"
               "/nube → cómo funciona el respaldo en GitHub\n"
               "/actualizar → el servidor instala la última versión\n\n"
@@ -1255,6 +1282,16 @@ def command(token, owner, st, ctx, cid, msg):
         reply(settings_line(st, uid))
     elif cmd == "/winrate":
         reply(winrate_report(st, uid))
+    elif cmd == "/confirmar" and is_owner:
+        if args:
+            new = args[0].lower() in ("si", "sí", "on", "1", "s")
+            if new != st.get("confirmar", True):
+                st["confirmar"] = new
+                for p in list(st.get("hist", {})):  # cambia la regla: winrate nuevo de 2h/4h
+                    if p.endswith(tuple("_" + t for t in CONFIRM_TFS)):
+                        del st["hist"][p]
+                st["hist_seeded"] = [p for p in st.get("hist_seeded", []) if not p.endswith(tuple("_" + t for t in CONFIRM_TFS))]
+        reply("🕯 Vela de confirmación en " + ", ".join(CONFIRM_TFS) + ": " + ("<b>activada</b> (la señal espera que la vela siguiente cierre a favor · backtest: caída máxima 27 R → 12 R)" if st.get("confirmar", True) else "desactivada (entrada al cierre de la vela de la señal)") + "\n/confirmar si · /confirmar no")
     elif cmd == "/calidad" and is_owner:
         if args:
             new = "A" if args[0].lower() in ("a", "si", "sí", "on", "1") else "todas"
@@ -1786,7 +1823,8 @@ def compute(sym, tf, st, want=None):
     gd = grade_dirs(sym, d, tf)
     qa = st.get("calidad", "A") == "A" and tf in QA_TFS and bool(gd)
     dirs = ([dir_series(sym, d, h) for h in m["htf"]] + (gd if qa else [])) or None
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym))
+    cf = qa and tf in CONFIRM_TFS and st.get("confirmar", True)
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf)
     for ev in events:
         if ev["kind"] == "OPEN":
             ev["g"], ev["gc"] = grade_at(gd, ev["bar"], ev["side"])
@@ -1798,7 +1836,7 @@ def compute(sym, tf, st, want=None):
             dl = fetch_long(sym, tf, 3000)
             dl_g = grade_dirs(sym, dl, tf, 1500) if qa else []
             dl_dirs = ([dir_series(sym, dl, h, 1500) for h in m["htf"]] + dl_g) or None
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym))
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf)
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3), e["side"], e["q"]) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
