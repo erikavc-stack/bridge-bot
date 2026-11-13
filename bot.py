@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.0"
+VERSION = "6.1"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -724,7 +724,7 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     pair, TF = sym + ".P", tf.upper()
     link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     k = ev["kind"]
-    if k == "OPEN":  # v6.0: tarjeta con tabla alineada (precios, cantidad y % en columnas)
+    if k == "OPEN":  # v6.1: tarjeta por bloques · confluencias con barra · TP/SL con %, R y qué hacer
         e1 = ev["price"]
         lim = ev.get("limit")
         c = coin(sym)
@@ -737,32 +737,41 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         risk = ev["risk"] * scale
         cc = ev.get("c") or (True, False, False)
         g, gc = ev.get("g"), ev.get("gc") or []
-        checks = list(zip(("Tend", "Mom", "WT"), cc)) + list(zip((GRADE_HTF.get(tf, ""), "BTC"), gc)) + ([("Vela", True)] if ev.get("cf") else [])
-        why = " ".join(f"{n}{'✓' if ok else '✗'}" for n, ok in checks)
+        htf = GRADE_HTF.get(tf, "")
+        checks = list(zip(("Tendencial", "Momentum", "WaveTrend"), cc)) + list(zip((htf, "BTC"), gc)) + ([("Vela", True)] if ev.get("cf") else [])
+        ok_n = sum(1 for _, ok in checks if ok)
+        bar = "▰" * ok_n + "▱" * (len(checks) - ok_n)
+        mk = lambda n, ok: f"{'✅' if ok else '❌'} {n}"
+        row1 = "  ".join(mk(n, ok) for n, ok in checks[:3])
+        row2 = "  ".join(mk(n, ok) for n, ok in checks[3:]) + (f"  · toque {ev['ep']}" if ev.get("ep") else "")
         pf = TF_PF.get(tf)
         light = "" if pf is None else "🟢" if pf >= 1.3 else "🟡" if pf >= 1.0 else "🔴"
-        head = f"{icon} <b>{s} · {c} · {tf}</b>  {ev['q']}/3" + (" ⭐<b>A</b>" if g == "A" else f" · {g}" if g else "")
-        rows = []
-        if not lim:
-            rows.append(("E1", fmt(e1), qs[0], ""))
-        rows += [("E2", fmt(ev["e2"]), qs[1], pe(ev["e2"])), ("E3", fmt(ev["e3"]), qs[2], pe(ev["e3"])),
-                 ("SL", fmt(ev["sl"]), "", pa(ev["sl"]))]
-        rows += [(f"TP{k}", fmt(t), "", pa(t)) for k, t in enumerate(ev["tps"], 1)]
-        w1, w2 = max(len(r[1]) for r in rows), max(len(r[2]) for r in rows)
-        table = "\n".join(f"{r[0]:<3} {r[1]:>{w1}}  {r[2]:<{w2}}  {r[3]}".rstrip() for r in rows)
-        lines = [head, (extra.get("wr") or "🏆 Winrate: calculando historial…") + (f" {light}" if light else "")]
+        sep = "━━━━━━━━━━━━━━━━━━"
+        head = f"{icon} <b>{s} · {c} · {tf}</b>" + ("   ⭐ <b>A</b>" if g == "A" else f"   · {g}" if g else "")
+        lines = [head, sep, (extra.get("wr") or "🏆 Winrate: calculando historial…") + (f" · PF {pf:.2f} {light}" if pf else ""),
+                 f"🎯 <b>Confluencias {ok_n}/{len(checks)}</b>  {bar}", f"   {row1}"]
+        if row2.strip():
+            lines.append(f"   {row2.strip()}")
         if extra.get("late"):
             lines.append(f"⏱ <i>de hace {extra['late']} min" + (f" · ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
-        if lim:
-            lines.append(f"💲 Ahora {money(e1)} · <b>solo órdenes límite</b>")
-        lines.append(f"<pre>{table}</pre>")
-        lines.append(f"⚡<b>{ev['lev']}x</b> · riesgo <b>−${risk:,.0f}</b> · margen ${margin:,.0f} · medio {money(avg_all)}")
+        # entradas
+        er = ([] if lim else [("E1", fmt(e1), qs[0], "ahora")]) + [("E2", fmt(ev["e2"]), qs[1], pe(ev["e2"])), ("E3", fmt(ev["e3"]), qs[2], pe(ev["e3"]))]
+        # objetivos: % desde el precio medio, R desde E1, cuánto cerrar
+        R = abs(e1 - ev["sl"]) or 1e-12
+        tr = [(f"TP{n}", fmt(t), pa(t), f"{abs(t - e1) / R:.1f}R", f"{TP_SPLIT[n - 1] * 100:.0f}%") for n, t in enumerate(ev["tps"], 1)]
+        tr.append(("SL", fmt(ev["sl"]), pa(ev["sl"]), "−1R", f"−${risk:,.0f}"))
+        w1 = max(len(r[1]) for r in er + tr)
+        wq = max(len(r[2]) for r in er)
+        wp = max(len(r[2]) for r in tr)
+        t_in = "\n".join(f"{r[0]:<4}{r[1]:>{w1}}  {r[2]:<{wq}}  {r[3]}".rstrip() for r in er)
+        t_out = "\n".join(f"{r[0]:<4}{r[1]:>{w1}}  {r[2]:>{wp}}  {r[3]:>4}  {r[4]}" for r in tr)
+        lines += [sep, "📥 <b>ENTRADAS</b>" + ("  · <b>solo órdenes límite</b>" if lim else "") + f"   (cant. {c})",
+                  f"<pre>{t_in}</pre>", f"⚖️ Precio medio <b>{money(avg_all)}</b>" + (f" · ahora {money(e1)}" if lim else ""),
+                  sep, "🎯 <b>OBJETIVOS</b>   (% desde el medio · cierra)", f"<pre>{t_out}</pre>"]
+        rb = abs(ev["tps"][-1] - avg_all) / max(abs(avg_all - ev["sl"]), 1e-12)
+        lines += [sep, f"⚡ <b>{ev['lev']}x</b> · margen ${margin:,.0f} · riesgo <b>−${risk:,.0f}</b> · R:B 1:{rb:.1f}"]
         if extra.get("tradfi"):
             lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
-        ctx_l = [why]
-        if ev.get("ep"):
-            ctx_l.append(f"toque {ev['ep']}")
-        lines.append("✅ " + " · ".join(ctx_l))
         ctx_l = []
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
@@ -777,48 +786,53 @@ def message(sym, tf, ev, extra=None, scale=1.0):
             lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
         if tf in WEAK_TF:
             lines.append(f"⚠️ <i>{WEAK_TF[tf]}</i>")
-        tips = (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
-        lines.append(f"{link}" + (f" · {extra['hm']}" if extra.get("hm") else "") + (" · <i>" + " · ".join(tips) + "</i>" if tips else ""))
+        tips = (["sin llenar al llegar a TP1 → cancela"] if lim else []) + (["en TP1 → SL a la entrada"] if tf in BE_TFS else [])
+        if tips:
+            lines.append("💡 <i>" + " · ".join(tips) + "</i>")
+        lines.append(f"🔗 {link}" + (f" · {extra['hm']}" if extra.get("hm") else ""))
         return "\n".join(lines)
-    hdr = f"{link} · {icon} <b>{s}</b>"
+    hdr = f"{icon} <b>{s} · {coin(sym)} · {tf}</b> · {link}"
+    prog = lambda n: "▰" * n + "▱" * (3 - n)
     if k == "FILL":
         return "\n".join([f"📥 <b>ORDEN LLENADA · E{ev.get('fills', 2)}</b>", hdr,
-                          f"💰 Precio medio ahora: {money(ev['price'])}", "", "✅ <i>Ya estás dentro: el SL y los TP siguen igual</i>"])
+                          f"⚖️ Precio medio ahora: <b>{money(ev['price'])}</b>", "✅ <i>Ya estás dentro: el SL y los TP siguen igual</i>"])
     if k == "CANCEL":
         why = "el precio llegó al TP1 sin tocar tu entrada" if ev.get("reason") == "tp1" else "apareció la señal contraria"
         return "\n".join(["❌ <b>ORDEN CANCELADA</b>", hdr,
-                          f"ℹ️ {why}.", "", "🗑 <b>Cancela tus órdenes límite E2/E3 de esta señal</b>"])
+                          f"ℹ️ {why}.", "🗑 <b>Cancela tus órdenes límite E2/E3 de esta señal</b>"])
     if k == "WEAK":
-        return "\n".join(["⚠️ <b>DEBILIDAD</b>", hdr, f"💲 Precio: {money(ev['price'])}", "",
-                          "📉 WaveTrend giró en contra en zona extrema: la operación pierde fuerza." if ev["side"] == 1 else
-                          "📈 WaveTrend giró en contra en zona extrema: la operación pierde fuerza.",
+        return "\n".join(["⚠️ <b>DEBILIDAD</b>", hdr, f"💲 Precio: {money(ev['price'])}",
+                          "〰️ WaveTrend giró en contra en zona extrema: la operación pierde fuerza.",
                           "💡 <i>Asegura ganancias: cierra una parte o sube el SL a la entrada</i>"])
     if k == "TP1":
-        return "\n".join(["✅ <b>TP1 ALCANZADO</b>", hdr,
-                          f"🎯 Precio: {money(ev['price'])}", "",
-                          "🔒 <b>Mueve el SL a la entrada</b> y cancela las órdenes E2/E3 que no se llenaron" if ev.get("be") else
-                          "💡 <i>Cierra una parte y deja correr el resto</i>",
-                          "💡 <i>El 40 % ya se cerró en TP1; el resto va a TP2/TP3 sin riesgo</i>" if ev.get("be") else ""])
+        return "\n".join(["🎯 <b>TP1 ALCANZADO</b>  " + prog(1) + "  → TP2", hdr,
+                          f"💲 Precio: {money(ev['price'])} · cierra el <b>{TP_SPLIT[0] * 100:.0f}%</b>",
+                          "🔒 <b>Mueve el SL a la entrada</b> y cancela E2/E3 sin llenar · el resto va sin riesgo" if ev.get("be") else
+                          "💡 <i>Deja correr el resto hacia TP2/TP3 con el SL original</i>"])
     if k == "SL":
         return "\n".join(["⛔ <b>STOP LOSS TOCADO</b>", hdr,
-                          f"🛟 Precio: {money(ev['price'])}", "", "ℹ️ <i>Si tenías el SL puesto, la operación ya se cerró.</i>",
-                          "<i>El resultado en $ llega al cerrar la vela.</i>"])
+                          f"💲 Precio: {money(ev['price'])}", "ℹ️ <i>Si tenías el SL puesto, la operación ya se cerró. El resultado en $ llega al cerrar la vela.</i>"])
     if k == "REPEAT":
         return "\n".join([f"🔁 <b>SEÑAL REPETIDA · {s}</b>", hdr,
-                          f"💲 Precio: {money(ev['price'])}" + (f" · TP{ev['tp']} ✓ ya tocado" if ev.get("tp") else ""),
+                          f"💲 Precio: {money(ev['price'])}" + (f" · {prog(ev['tp'])} TP{ev['tp']} ✓" if ev.get("tp") else ""),
                           "💡 <i>Tu operación sigue abierta: no se abre otra, sigue con la que tienes.</i>"])
     if k == "WKND":
-        return "\n".join(["⚠️ <b>CIERRE DE FIN DE SEMANA</b>", hdr, "",
+        return "\n".join(["⚠️ <b>CIERRE DE FIN DE SEMANA</b>", hdr,
                           "🏛 El mercado real (bolsa / materias primas) cierra pronto hasta el domingo-lunes.",
                           "📉 Al reabrir el precio puede saltar por encima de tu SL.",
                           "💡 <i>Considera cerrar o reducir esta operación antes del cierre.</i>"])
     res = {"tp3": "🏁 TP3 alcanzado", "stop": "⛔ Stop loss" if not ev.get("tp") else "🏁 Resto cerrado en SL tras TP",
            "reverse": "🔄 Señal contraria", "be": "🔒 Resto cerrado en la entrada tras TP1"}[ev["reason"]]
     pnl = ev["pnl"] * scale
-    lines = [f"{'🏁' if pnl >= 0 else '🩸'} <b>OPERACIÓN CERRADA · {'GANADA' if pnl >= 0 else 'PERDIDA'}</b>", hdr,
-             f"📌 Motivo: {res}" + (f" · salida {money(ev['price'])}" if ev.get("price") else ""),
-             f"{'💰' if pnl >= 0 else '🩸'} Resultado: <b>{'+' if pnl >= 0 else '-'}${abs(pnl):,.2f}</b> ({ev['r']:+.2f} R)",
-             "<i>Operación terminada · espera la próxima señal</i> 🚢"]
+    win = pnl >= 0
+    ntp = min(int(ev.get("tp") or 0), 3)
+    lines = [f"{'🏆' if win else '🩸'} <b>OPERACIÓN CERRADA · {'GANADA' if win else 'PERDIDA'}</b>", hdr,
+             f"📌 {res}" + (f" · salida {money(ev['price'])}" if ev.get("price") else ""),
+             f"🎯 Objetivos {prog(ntp)} {ntp}/3",
+             f"{'💰' if win else '🩸'} <b>{'+' if win else '−'}${abs(pnl):,.2f}</b> · <b>{ev['r']:+.2f} R</b>"]
+    if extra.get("wr"):
+        lines.append(extra["wr"])
+    lines.append("<i>Operación terminada · espera la próxima señal</i> 🚢")
     return "\n".join(lines)
 
 
