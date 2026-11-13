@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v5.6 (misma lógica que el indicador Bridge Táctico v9.8 · TP3 a 1.5 R · aviso de señal repetida · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v6.0 (misma lógica que el indicador Bridge Táctico v10 · 15m con 4h+1D y vela · 1h con 8h · 5m con 1h+4h y vela · 4h desde el 2º toque · TP3 a 1.5 R · aviso de señal repetida · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "5.6"
+VERSION = "6.0"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -445,7 +445,9 @@ QA_REF = "BTCUSDT"
 # v5.4: en esas mismas temporalidades no se abren señales en velas de fin de semana (sábado/domingo UTC, poca liquidez).
 # Backtest 30 monedas 2h+4h+8h: factor 1.38 → 1.51 y más ganancia total (97.6 R → 111.3 R), 23 de 30 monedas en positivo.
 # 1h pierde en el backtest con cualquier filtro probado (mejor caso factor 0.96): se avisa en el mensaje.
-WEAK_TF = {"1h": "1h pierde en el backtest (factor 0.9): mejor 2h/4h/8h"}
+WEAK_TF = {"1m": "1m pierde en el backtest: solo con riesgo mínimo", "3m": "3m pierde en el backtest (factor 0.8): solo con riesgo mínimo"}
+# v6.0: semáforo de cada temporalidad según el backtest de 30 monedas (factor de beneficio)
+TF_PF = {"3m": 0.8, "5m": 1.1, "15m": 1.5, "1h": 1.1, "2h": 1.9, "4h": 2.1, "8h": 1.7}
 # v5.5 · VELA DE CONFIRMACIÓN en 2h y 4h: la señal espera a que la vela siguiente cierre a favor (cuerpo a favor y cierre
 # más allá del cierre anterior) y la entrada es al cierre de esa vela. Backtest 30 monedas 2h+4h+8h (8h sin cambio):
 # acierto 51 % → 54 %, factor 1.51 → 1.74, caída máxima 27 R → 12 R, peor racha 20 → 9 pérdidas; ganancia total −9 %.
@@ -453,20 +455,28 @@ CONFIRM_TFS = tuple(t for t in os.environ.get("CONFIRM_TFS", "2h,4h").split(",")
 
 
 def tf_mode(tf, st):
-    """Auditoría v3.6 (24 monedas, comisiones de Bitunix):
-    5m  → límite + a favor de la Tendencial de 15m (+0.20 R/op) · 4h → límite (+0.23 R/op)
-    1m/3m → modo preciso (a favor de 15m y 4h, DCA 10/30/60) · 15m/1h → DCA 20/30/50 a mercado."""
-    be = tf in BE_TFS  # SL a la entrada tras TP1 (backtest v4.6/4.7: mejora 15m, 4h y 1d; en 1h, 2h y 8h empeora)
-    # v4.7: 2h y 8h → DCA 20/30/50 a mercado (backtest 48 monedas: factor 2h 1.06 · 8h 1.42); 1d → DCA + SL a la entrada
-    if st.get("limit", True) and tf in ("5m", "4h"):
-        return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=["15m"] if tf == "5m" else [], be=be)
+    """Modo de cada temporalidad. v6.0 (backtest 30 monedas, nov-2026, comisiones incluidas):
+    15m → a favor de la Tendencial de 4h y 1D + vela de confirmación (factor 0.93 → 1.47, caída 75 R → 13 R)
+    1h  → a favor de la Tendencial de 8h (0.94 → 1.14, igual en las dos mitades del historial)
+    5m  → límite + a favor de 1h y 4h + vela de confirmación (0.78 → 1.09, pocas señales)
+    4h  → límite, desde el 2º toque a la Tendencial tras su giro (1.35 → 2.06; el 1er toque perdía: 0.69)
+    1m/3m → modo preciso (a favor de 15m y 4h); pierden con todo lo probado: llevan aviso."""
+    be = tf in BE_TFS  # SL a la entrada tras TP1 (mejora 15m, 4h y 1d; en 1h, 2h y 8h empeora)
+    if st.get("limit", True) and tf == "5m":
+        return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=["1h", "4h"], be=be, cf=True, min_ep=1)
+    if st.get("limit", True) and tf == "4h":
+        return dict(mode="limit", W=LIM_W, min_dist=MIN_DIST, htf=[], be=be, cf=False, min_ep=2)
     if st.get("h4", True) and TF_MS.get(tf, 0) <= 300_000:
-        return dict(mode="low", W=LOW_W, min_dist=LOW_MIN_DIST, htf=["4h", "15m"], be=be)
-    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[], be=be)
+        return dict(mode="low", W=LOW_W, min_dist=LOW_MIN_DIST, htf=["4h", "15m"], be=be, cf=False, min_ep=1)
+    if tf == "15m":
+        return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=["4h", "1d"], be=be, cf=True, min_ep=1)
+    if tf == "1h":
+        return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=["8h"], be=be, cf=False, min_ep=1)
+    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[], be=be, cf=False, min_ep=1)
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia exacta del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False, confirm=False):
+def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False, confirm=False, min_ep=1):
     """Señales y gestión vela a vela. dirs = Tendencial de temporalidades mayores que debe ir a favor.
     W[0] == 0 → modo límite: no se entra a mercado; si el precio llega al TP1 sin llenar E2, la orden se cancela.
     Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta.
@@ -475,6 +485,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
     st, di, atr, mom, adx, wt1, wt2, e200 = (I[k] for k in ("st", "dir", "atr", "mom", "adx", "wt1", "wt2", "ema"))
     events = []
     last_zone, zone_side, fired = -10**9, 0, False
+    ep = 0  # v6.0: nº de toque a la Tendencial desde su último giro
     last_xup = last_xdn = -10**9
     T = None
     pend = None  # v5.5: señal en espera de la vela de confirmación (lado, vela, calidad, condiciones)
@@ -485,7 +496,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
         up = di[i] < 0
         side = 1 if up else -1
         if di[i] != di[i - 1]:
-            last_zone, fired = -10**9, False
+            last_zone, fired, ep = -10**9, False, 0
         if wt1[i] > wt2[i] and wt1[i - 1] <= wt2[i - 1] and min(wt1[i], wt1[i - 1]) <= -WT_LVL:
             last_xup = i
         if wt1[i] < wt2[i] and wt1[i - 1] >= wt2[i - 1] and max(wt1[i], wt1[i - 1]) >= WT_LVL:
@@ -494,6 +505,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
         if z <= ZONE_ATR and (b["c"] > st[i] if up else b["c"] < st[i]):
             if i - last_zone > TOUCH_WIN:
                 fired = False
+                ep += 1
             last_zone, zone_side = i, side
         c1 = i - last_zone <= TOUCH_WIN and zone_side == side
         c2 = (mom[i] > mom[i - 1] if up else mom[i] < mom[i - 1]) and adx[i] < adx[i - 1]
@@ -502,19 +514,19 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
         ok_ema = (not USE_EMA) or (b["c"] > e200[i] if up else b["c"] < e200[i])
         ok_htf = all(ds[i] == side for ds in dirs) if dirs else True
         ok_wk = not (no_wknd and time.gmtime(b["ct"] / 1000).tm_wday >= 5)  # v5.4: sin entradas en velas de sábado/domingo (UTC)
-        sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_htf and ok_wk
+        sig = c1 and not fired and score >= MIN_TRADE and ok_ema and ok_htf and ok_wk and ep >= min_ep
         if sig:
             fired = True
-        sig_q, sig_c = score, (c1, c2, c3)
+        sig_q, sig_c, sig_ep = score, (c1, c2, c3), ep
         if confirm:  # v5.5: se entra al cierre de la vela siguiente solo si cierra a favor
             new_side = 0
             if pend and pend[1] == i - 1:
                 pc = d[i - 1]["c"]
                 if pend[0] == side and ((b["c"] > b["o"] and b["c"] > pc) if side == 1 else (b["c"] < b["o"] and b["c"] < pc)):
-                    new_side, sig_q, sig_c = side, pend[2], pend[3]
+                    new_side, sig_q, sig_c, sig_ep = side, pend[2], pend[3], pend[4]
                 pend = None
             if sig:
-                pend = (side, i, score, (c1, c2, c3))
+                pend = (side, i, score, (c1, c2, c3), ep)
         else:
             new_side = side if sig else 0
         last = dict(pts=score if c1 else 0, c=(c1, c2, c3), pend=bool(pend) and pend[1] == i)
@@ -593,7 +605,7 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
             T = dict(side=s, q=sig_q, bar=i, e1=e1, e2=e2, e3=e3, sl=sl, tps=tps, avg=e1, pos=W[0], fills=1, tp=0,
                      real=0.0, remS=1.0, fees=W[0] * FEE_TAKER, notional=notional, lev=lev, qty=qty, margin=margin)
             events.append(dict(kind="OPEN", bar=i, side=s, price=e1, q=sig_q, sl=sl, tps=tps, e2=e2, e3=e3, lev=lev,
-                               c=sig_c, qty=qty, margin=margin, risk=risk_usd, limit=W[0] == 0, w=W, cf=confirm))
+                               c=sig_c, qty=qty, margin=margin, risk=risk_usd, limit=W[0] == 0, w=W, cf=confirm, ep=sig_ep))
     return events, T, last
 
 
@@ -712,59 +724,61 @@ def message(sym, tf, ev, extra=None, scale=1.0):
     pair, TF = sym + ".P", tf.upper()
     link = f'<a href="{chart_url(sym, tf)}">{pair} {TF}</a>'
     k = ev["kind"]
-    if k == "OPEN":  # v5.3: detallado y compacto · winrate y calidad siempre visibles
+    if k == "OPEN":  # v6.0: tarjeta con tabla alineada (precios, cantidad y % en columnas)
         e1 = ev["price"]
         lim = ev.get("limit")
         c = coin(sym)
         W = ev.get("w") or DCA_W
-        q1, q2, q3 = (fq(x * scale) for x in ev["qty"])
+        qs = [fq(x * scale) for x in ev["qty"]]
         avg_all = e1 * W[0] + ev["e2"] * W[1] + ev["e3"] * W[2]
         pa = lambda x: f"{ev['side'] * (x - avg_all) / avg_all * 100:+.1f}%"   # + a favor / − en contra, desde tu precio medio
         pe = lambda x: f"{(x - e1) / e1 * 100:+.1f}%"
         margin = sum(ev.get("margin") or [0]) * scale
         risk = ev["risk"] * scale
         cc = ev.get("c") or (True, False, False)
-        why = " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip(("Tend", "Mom", "WT"), cc))
         g, gc = ev.get("g"), ev.get("gc") or []
-        if gc:
-            why += " · " + " · ".join(f"{n} {'✓' if ok else '✗'}" for n, ok in zip((GRADE_HTF.get(tf, ""), "BTC"), gc))
-        if ev.get("cf"):
-            why += " · Vela ✓"
-        gtx = "" if not g else " · ⭐ <b>Calidad A</b>" if g == "A" else f" · Calidad {g}"
-        bar = "━━━━━━━━━━━━"
-        lines = [f"{icon} <b>{s} · {c} {tf}</b> · {ev['q']}/3{gtx}" + (f" · {extra['hm']}" if extra.get("hm") else ""),
-                 f"{link} · {why}",
-                 extra.get("wr") or "🏆 Winrate: calculando historial…"]
+        checks = list(zip(("Tend", "Mom", "WT"), cc)) + list(zip((GRADE_HTF.get(tf, ""), "BTC"), gc)) + ([("Vela", True)] if ev.get("cf") else [])
+        why = " ".join(f"{n}{'✓' if ok else '✗'}" for n, ok in checks)
+        pf = TF_PF.get(tf)
+        light = "" if pf is None else "🟢" if pf >= 1.3 else "🟡" if pf >= 1.0 else "🔴"
+        head = f"{icon} <b>{s} · {c} · {tf}</b>  {ev['q']}/3" + (" ⭐<b>A</b>" if g == "A" else f" · {g}" if g else "")
+        rows = []
+        if not lim:
+            rows.append(("E1", fmt(e1), qs[0], ""))
+        rows += [("E2", fmt(ev["e2"]), qs[1], pe(ev["e2"])), ("E3", fmt(ev["e3"]), qs[2], pe(ev["e3"])),
+                 ("SL", fmt(ev["sl"]), "", pa(ev["sl"]))]
+        rows += [(f"TP{k}", fmt(t), "", pa(t)) for k, t in enumerate(ev["tps"], 1)]
+        w1, w2 = max(len(r[1]) for r in rows), max(len(r[2]) for r in rows)
+        table = "\n".join(f"{r[0]:<3} {r[1]:>{w1}}  {r[2]:<{w2}}  {r[3]}".rstrip() for r in rows)
+        lines = [head, (extra.get("wr") or "🏆 Winrate: calculando historial…") + (f" {light}" if light else "")]
         if extra.get("late"):
             lines.append(f"⏱ <i>de hace {extra['late']} min" + (f" · ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
-        if extra.get("tradfi"):
-            lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
-        lines.append(bar)
         if lim:
             lines.append(f"💲 Ahora {money(e1)} · <b>solo órdenes límite</b>")
-        else:
-            lines.append(f"💰 E1 {money(e1)} · {q1}")
-        lines += [f"📥 E2 {money(ev['e2'])} ({pe(ev['e2'])}) · {q2}",
-                  f"📥 E3 {money(ev['e3'])} ({pe(ev['e3'])}) · {q3}",
-                  f"🛑 SL {money(ev['sl'])} ({pa(ev['sl'])}) · <b>−${risk:,.0f}</b> · ⚡<b>{ev['lev']}x</b>",
-                  *[f"🎯 TP{k} {money(t)} ({pa(t)})" for k, t in enumerate(ev['tps'], 1)],
-                  bar]
-        ctx_l = [f"⚖️ Medio {money(avg_all)} · margen ${margin:,.0f}"]
+        lines.append(f"<pre>{table}</pre>")
+        lines.append(f"⚡<b>{ev['lev']}x</b> · riesgo <b>−${risk:,.0f}</b> · margen ${margin:,.0f} · medio {money(avg_all)}")
+        if extra.get("tradfi"):
+            lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
+        ctx_l = [why]
+        if ev.get("ep"):
+            ctx_l.append(f"toque {ev['ep']}")
+        lines.append("✅ " + " · ".join(ctx_l))
+        ctx_l = []
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
             ctx_l.append(f"📈 {fav}/{len(extra['dirs'])} TF a favor")
+        if extra.get("conf"):
+            ctx_l.append(f"🔥 también {s} en {' '.join(extra['conf'])}")
         if "open_n" in extra:
             ctx_l.append(f"🧯 {extra.get('open_n', 0) + 1}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else "") + " abiertas")
-        lines.append(" · ".join(ctx_l))
-        if extra.get("conf"):
-            lines.append(f"🔥 También {s}: {' · '.join(extra['conf'])}")
+        if ctx_l:
+            lines.append(" · ".join(ctx_l))
         if extra.get("same"):
             lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
         if tf in WEAK_TF:
             lines.append(f"⚠️ <i>{WEAK_TF[tf]}</i>")
         tips = (["sin llenar en TP1 → cancela"] if lim else []) + (["TP1 → SL a entrada"] if tf in BE_TFS else [])
-        if tips:
-            lines.append("📋 <i>" + " · ".join(tips) + "</i>")
+        lines.append(f"{link}" + (f" · {extra['hm']}" if extra.get("hm") else "") + (" · <i>" + " · ".join(tips) + "</i>" if tips else ""))
         return "\n".join(lines)
     hdr = f"{link} · {icon} <b>{s}</b>"
     if k == "FILL":
@@ -936,6 +950,8 @@ def load_state():
     st.setdefault("offset", 0)
     st.setdefault("calidad", "A")
     st.setdefault("confirmar", True)
+    if not st.get("v60"):  # v6.0: reglas nuevas en 5m, 15m, 1h y 4h → winrate nuevo
+        st["hist"], st["hist_seeded"], st["v60"] = {}, [], True
     if not st.get("v56"):  # v5.6: TP3 a 1.5 R en todas las temporalidades → winrate nuevo
         st["hist"], st["hist_seeded"], st["v56"] = {}, [], True
     if not st.get("v55"):  # v5.5: 2h/4h con vela de confirmación → winrate nuevo para esas temporalidades
@@ -1833,8 +1849,8 @@ def compute(sym, tf, st, want=None):
     gd = grade_dirs(sym, d, tf)
     qa = st.get("calidad", "A") == "A" and tf in QA_TFS and bool(gd)
     dirs = ([dir_series(sym, d, h) for h in m["htf"]] + (gd if qa else [])) or None
-    cf = qa and tf in CONFIRM_TFS and st.get("confirmar", True)
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf)
+    cf = ((qa and tf in CONFIRM_TFS) or m.get("cf", False)) and st.get("confirmar", True)
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1))
     for ev in events:
         if ev["kind"] == "OPEN":
             ev["g"], ev["gc"] = grade_at(gd, ev["bar"], ev["side"])
@@ -1846,7 +1862,7 @@ def compute(sym, tf, st, want=None):
             dl = fetch_long(sym, tf, 3000)
             dl_g = grade_dirs(sym, dl, tf, 1500) if qa else []
             dl_dirs = ([dir_series(sym, dl, h, 1500) for h in m["htf"]] + dl_g) or None
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf)
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1))
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3), e["side"], e["q"]) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
