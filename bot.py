@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.1"
+VERSION = "6.2"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -447,7 +447,7 @@ QA_REF = "BTCUSDT"
 # 1h pierde en el backtest con cualquier filtro probado (mejor caso factor 0.96): se avisa en el mensaje.
 WEAK_TF = {"1m": "1m pierde en el backtest: solo con riesgo mínimo", "3m": "3m pierde en el backtest (factor 0.8): solo con riesgo mínimo"}
 # v6.0: semáforo de cada temporalidad según el backtest de 30 monedas (factor de beneficio)
-TF_PF = {"3m": 0.8, "5m": 1.1, "15m": 1.5, "1h": 1.1, "2h": 1.9, "4h": 2.1, "8h": 1.7}
+TF_PF = {"3m": 0.8, "5m": 1.1, "15m": 1.5, "1h": 1.1, "2h": 1.9, "4h": 2.1, "8h": 1.6}
 # v5.5 · VELA DE CONFIRMACIÓN en 2h y 4h: la señal espera a que la vela siguiente cierre a favor (cuerpo a favor y cierre
 # más allá del cierre anterior) y la entrada es al cierre de esa vela. Backtest 30 monedas 2h+4h+8h (8h sin cambio):
 # acierto 51 % → 54 %, factor 1.51 → 1.74, caída máxima 27 R → 12 R, peor racha 20 → 9 pérdidas; ganancia total −9 %.
@@ -472,11 +472,11 @@ def tf_mode(tf, st):
         return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=["4h", "1d"], be=be, cf=True, min_ep=1)
     if tf == "1h":
         return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=["8h"], be=be, cf=False, min_ep=1)
-    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[], be=be, cf=False, min_ep=1)
+    return dict(mode="dca", W=DCA_W, min_dist=MIN_DIST, htf=[], be=be, cf=False, min_ep=1, sr=50 if tf == "8h" else 0)
 
 
 # ----------------------------- SEÑALES + GESTIÓN (copia exacta del motor del indicador) -----------------------------
-def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False, confirm=False, min_ep=1):
+def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=False, no_wknd=False, confirm=False, min_ep=1, sr_n=0):
     """Señales y gestión vela a vela. dirs = Tendencial de temporalidades mayores que debe ir a favor.
     W[0] == 0 → modo límite: no se entra a mercado; si el precio llega al TP1 sin llenar E2, la orden se cancela.
     Contabilidad v3.6: cada TP cierra un % de lo que REALMENTE está abierto; ganada = cierre con ganancia neta.
@@ -599,6 +599,11 @@ def simulate(d, I, capital, risk_pct, dirs=None, W=DCA_W, min_dist=None, be=Fals
             lev = rec_leverage(worst)
             R = abs(e1 - sl)
             tps = [e1 + s * R * r for r in TP_R]
+            if sr_n:  # v6.2 (8h): TP3 en el último máximo/mínimo de sr_n velas (−0.1 ATR), entre 1 R y 3 R · factor 1.36 → 1.60
+                lo_ = max(0, i - sr_n)
+                lvl = (max(x["h"] for x in d[lo_:i]) if s == 1 else min(x["l"] for x in d[lo_:i])) - s * 0.1 * atr[i]
+                k3 = min(max(s * (lvl - e1) / R, 1.0), 3.0)
+                tps = [e1 + s * R * r for r in (min(0.5, k3 * 0.33), 1.0 if k3 >= 1.5 else k3 * 0.66, k3)]
             notional = risk_usd / worst
             qty = [notional * w / e for w, e in zip(W, (e1, e2, e3))]
             margin = [notional * w / lev for w in W]
@@ -964,6 +969,8 @@ def load_state():
     st.setdefault("offset", 0)
     st.setdefault("calidad", "A")
     st.setdefault("confirmar", True)
+    if not st.get("v62"):  # v6.2: TP en soporte/resistencia en 8h → winrate nuevo
+        st["hist"], st["hist_seeded"], st["v62"] = {}, [], True
     if not st.get("v60"):  # v6.0: reglas nuevas en 5m, 15m, 1h y 4h → winrate nuevo
         st["hist"], st["hist_seeded"], st["v60"] = {}, [], True
     if not st.get("v56"):  # v5.6: TP3 a 1.5 R en todas las temporalidades → winrate nuevo
@@ -1864,7 +1871,7 @@ def compute(sym, tf, st, want=None):
     qa = st.get("calidad", "A") == "A" and tf in QA_TFS and bool(gd)
     dirs = ([dir_series(sym, d, h) for h in m["htf"]] + (gd if qa else [])) or None
     cf = ((qa and tf in CONFIRM_TFS) or m.get("cf", False)) and st.get("confirmar", True)
-    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1))
+    events, T, last = simulate(d, I, st["capital"], st["risk"], dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1), m.get("sr", 0))
     for ev in events:
         if ev["kind"] == "OPEN":
             ev["g"], ev["gc"] = grade_at(gd, ev["bar"], ev["side"])
@@ -1876,7 +1883,7 @@ def compute(sym, tf, st, want=None):
             dl = fetch_long(sym, tf, 3000)
             dl_g = grade_dirs(sym, dl, tf, 1500) if qa else []
             dl_dirs = ([dir_series(sym, dl, h, 1500) for h in m["htf"]] + dl_g) or None
-            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1))
+            evl, _, _ = simulate(dl, indicators(dl), st["capital"], st["risk"], dl_dirs, m["W"], m["min_dist"], m["be"], qa and not tradfi_kind(sym), cf, m.get("min_ep", 1), m.get("sr", 0))
             seed = [(str(dl[e["entry"]]["t"]), 1 if e["win"] else 0, round(e["r"], 3), e["side"], e["q"]) for e in evl if e["kind"] == "CLOSE" and e["entry"] >= 250]
         except Exception as e:
             print(f"⚠️ historial {sym} {tf}: {e}")
