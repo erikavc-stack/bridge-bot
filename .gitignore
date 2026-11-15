@@ -4,3 +4,12 @@ state.json.bak
 state.json.tmp
 oracle_instalar_mio.sh
 __pycache__/
+bx_state.json
+bx_state.json.tmp
+# Panel BRIDGE: ajustes, llaves de Bitunix y operaciones del panel (nunca subir)
+panel.json
+panel.json.tmp
+panel_llaves.json
+panel_llaves.json.tmp
+bx_panel.json
+bx_panel.json.tmp

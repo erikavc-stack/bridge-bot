@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bridge Táctico → Telegram  ·  v6.0 (misma lógica que el indicador Bridge Táctico v10 · 15m con 4h+1D y vela · 1h con 8h · 5m con 1h+4h y vela · 4h desde el 2º toque · TP3 a 1.5 R · aviso de señal repetida · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
+Bridge Táctico → Telegram  ·  v6.4 (misma lógica que el indicador Bridge Táctico v10 · 15m con 4h+1D y vela · 1h con 8h · 5m con 1h+4h y vela · 4h desde el 2º toque · TP3 a 1.5 R · aviso de señal repetida · CALIDAD A en 2h/4h/8h sin fin de semana · vela de confirmación en 2h/4h · 1m a 1d · SL a la entrada tras TP1 en 15m/4h/1d · diario /stats ·
 confluencias 🔥 (LONG/SHORT activo en 3+ temporalidades) · BTC y ETH vigilados de cerca)
 Vigila tus monedas en 1m · 3m · 5m · 15m · 1h · 2h · 4h · 8h · 1d y avisa por Telegram, cada señal en su propio mensaje:
   señal LONG/SHORT con entrada (o órdenes límite), DCA, SL, TP, apalancamiento y cantidad,
@@ -16,10 +16,10 @@ Modos:
   python bot.py --loop   → corre sin parar en tu PC (señales al instante, todas las temporalidades)
   python bot.py          → una sola pasada (GitHub Actions: respaldo 15m/1h/4h cuando la PC está apagada)
 """
-import json, os, re, sys, time, threading, socket, signal, html, math
+import json, os, re, sys, time, threading, socket, signal, html, math, hashlib, uuid
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.2"
+VERSION = "6.4"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -1173,6 +1173,11 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/confirmar si|no → 2h/4h esperan la vela de confirmación (recomendado)\n"
               "/radar cada 30 · /radar off → radar automático\n"
               "/nube → cómo funciona el respaldo en GitHub\n"
+              "/auto → órdenes automáticas en Bitunix (prueba · real · capital · riesgo · límites · gestión)\n"
+              "/apuntar si|prueba|no → botón 🎯 en cada señal para abrirla en Bitunix (con confirmación)\n"
+              "/posiciones → tus posiciones en Bitunix: PnL no realizado, SL y riesgo abierto\n"
+              "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
+              "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
               "/actualizar → el servidor instala la última versión\n\n"
               "👥 Para compartir: pásale a tu amigo el enlace del bot. Al pulsar INICIAR te llega una solicitud para aprobarla.")
 
@@ -1247,6 +1252,24 @@ def handle_callback(token, owner, st, cq):
     elif data == "cfg:done" and uid in st["users"]:
         tg(token, "editMessageText", {"chat_id": cid, "message_id": mid, "parse_mode": "HTML",
                                       "text": "✅ <b>Guardado</b>\n" + settings_line(st, uid)})
+    # v6.4 · 🎯 Apuntar en Bitunix (solo el administrador): pulsar → plan + confirmar → se envía
+    elif data.startswith("ap:") and uid == "owner":
+        note = aim_press(token, owner, st, data[3:])
+    elif data.startswith(("apc:", "apx:")) and uid == "owner":
+        if data.startswith("apc:"):
+            note = aim_confirm(token, owner, st, data[4:])
+        else:
+            st.get("aim", {}).get(data[4:], {}).pop("ask", None)
+            note = "Cancelado: no se envió nada"
+        try:  # se quitan los botones para no confirmar dos veces
+            tg(token, "editMessageReplyMarkup", {"chat_id": cid, "message_id": mid, "reply_markup": kb([])})
+        except Exception:
+            pass
+    elif data.startswith("dv:") and uid == "owner":
+        try:
+            note = bx_devolver(data[3:])
+        except Exception as e:
+            note = f"No se pudo: {e}"[:180]
     try:
         tg(token, "answerCallbackQuery", {"callback_query_id": cq["id"], "text": note})
     except Exception:
@@ -1435,9 +1458,95 @@ def command(token, owner, st, ctx, cid, msg):
             reply(f"♻️ [{HOST}] reiniciando para instalar la última versión… (vuelve en 1-2 min)")
             raise KeyboardInterrupt
         reply("ℹ️ /actualizar solo funciona en el servidor. En la PC cierra la ventana y vuelve a abrir iniciar_bot.bat.")
+    elif cmd == "/auto":
+        a = args[0].lower() if args else ""
+        v = parse_num(args[1:], amount=True)
+        words = [x.lower() for x in args[1:]]
+        if a in ("prueba", "test"):
+            st["auto"] = "prueba"
+        elif a in ("no", "off"):
+            st["auto"] = ""
+        elif a in ("si", "sí", "on"):
+            err = auto_arm_error(st)
+            if err:
+                reply("⛔ No se activó el modo real: " + html.escape(err))
+                return
+            st["auto"] = "si"
+            reply("💸 <b>Modo REAL activado</b>: cada señal que pase el filtro entra en Bitunix con su SL. /auto no lo apaga.")
+        elif a == "capital" and v and v > 0:
+            st["auto_capital"] = v
+        elif a == "riesgo" and v and 0 < v <= 10:
+            st["auto_risk"] = v
+        elif a == "ops" and v and v >= 1:
+            st["auto_ops"] = int(v)
+        elif a in ("perdida", "pérdida") and v and 0 < v <= 50:
+            st["auto_loss"] = v
+        elif a == "max" and v and v > 0:
+            st["auto_max"] = v
+        elif a == "lev" and v is not None and v >= 0:
+            st["auto_lev"] = int(v)
+        elif a == "tf" and words:
+            st["auto_tfs"] = [t for t in ALL_TFS if t in words] or list(AUTO_TFS)
+        elif a == "be" and words:
+            st["auto_be"] = list(ALL_TFS) if words[0] in ("si", "sí", "on") else [t for t in ALL_TFS if t in words]
+        elif a in ("gestion", "gestión") and words and words[0] in ("bot", "strike"):
+            st["auto_mg"] = words[0]   # se aplica a las operaciones NUEVAS
+        elif a == "berr" and v and 0.3 <= v <= 5:
+            st["auto_berr"] = v
+        elif a == "parcial" and v is not None and 0 <= v <= 90:
+            st["auto_parcial"] = v
+        elif a == "compensado" and words:
+            st["auto_comp"] = words[0] in ("si", "sí", "on")
+        reply(auto_status(st))
+    elif cmd in ("/posiciones", "/pos"):
+        try:
+            text, btn = positions_report(st)
+            reply(text, btn)
+        except Exception as e:
+            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}")
+    elif cmd == "/apuntar":
+        a = args[0].lower() if args else ""
+        if a in ("si", "sí", "on"):
+            err = auto_arm_error(st)
+            if err:
+                reply("⛔ 🎯 Apuntar sigue en prueba: " + html.escape(err))
+                return
+            st["aim_mode"] = "si"
+        elif a in ("prueba", "test"):
+            st["aim_mode"] = "prueba"
+        elif a in ("no", "off"):
+            st["aim_mode"] = "no"
+        mode = {"si": "💸 <b>REAL</b> (al confirmar se envía a Bitunix)", "prueba": "🧪 PRUEBA (muestra las órdenes, no envía nada)",
+                "no": "apagado (sin botón)"}[st.get("aim_mode", "prueba")]
+        reply(f"🎯 <b>Apuntar</b> [{HOST}]: {mode}\nCada señal trae el botón 🎯: lo pulsas, ves el plan con tu capital y riesgo de "
+              "/auto, y confirmas. Usa los mismos límites (margen máx., apalancamiento, pérdida diaria) y la misma gestión.\n"
+              "/apuntar si · /apuntar prueba · /apuntar no")
+    elif cmd == "/seguro":
+        a = args[0].lower() if args else ""
+        v = parse_num(args)
+        if a in ("si", "sí", "on"):
+            st["seguro"] = True
+        elif a in ("no", "off"):
+            st["seguro"] = False
+        elif v and 0.5 <= v <= 50:
+            st["seguro"], st["seguro_lim"] = True, v
+        reply(f"🛡 <b>Seguro de riesgo</b>: {'activado' if st.get('seguro', True) else 'apagado'} · límite "
+              f"{st.get('seguro_lim', 5.0):g} % de la cuenta\nTe aviso si lo que perderías con todos tus SL abiertos en Bitunix "
+              "pasa ese %, o si una posición tuya no tiene stop.\n/seguro 5 · /seguro si · /seguro no")
+    elif cmd == "/bitunix":
+        try:
+            if args and args[0].lower() == "hedge":
+                bx_req("POST", "/api/v1/futures/account/change_position_mode", body={"positionMode": "HEDGE"})
+            acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+            pm = (bx_req("GET", "/api/v1/futures/account/position_mode") or {}).get("positionMode")
+            reply(f"✅ <b>Bitunix conectado</b> [{HOST}]\nDisponible: {acc.get('available')} USDT · margen en uso: {acc.get('margin')}\n"
+                  f"Modo de posición: {pm}" + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)"))
+        except Exception as e:
+            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}")
     elif cmd == "/nube":
-        reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{' ★' if MAIN else ''} · v{VERSION}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
-              "dice cuál). El servidor 24/7 (★) tiene prioridad; si se apaga, toma el control la PC en 4 min. "
+        reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{marks()} · v{VERSION}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
+              "dice cuál). Prioridad: el equipo con llaves de Bitunix (🔑, el que opera) > el servidor 24/7 (★) > la PC; "
+              "si el que envía se apaga, otro toma el control en 4 min. "
               "Si no hay ninguno, GitHub avisa 15m, 1h y 4h solo al administrador y con 5-30 min de retraso.")
 
 
@@ -1890,17 +1999,836 @@ def compute(sym, tf, st, want=None):
     return dict(sym=sym, tf=tf, d=d, up=I["dir"][-1] < 0, st=I["st"][-1], events=events, T=T, pts=last["pts"], seed=seed)
 
 
-def deliver(token, owner, st, uids, sym, tf, ev, extra=None, per_user=None):
+# ----------------------------- BITUNIX: ÓRDENES AUTOMÁTICAS (v6.3 · fase 1: modo prueba) -----------------------------
+# Las llaves NUNCA van en este archivo (el repositorio es público): config.json → "bitunix_key" y "bitunix_secret",
+# o variables de entorno BITUNIX_KEY / BITUNIX_SECRET. Crea la llave en Bitunix solo con permiso de trading (sin retiros).
+BX = "https://fapi.bitunix.com"
+AUTO_CAP = 10.0   # margen máximo por operación (USDT) en modo automático; se cambia con /auto max
+_bx_pairs = {"t": 0.0, "d": {}}
+
+
+def bx_keys():
+    k, s = os.environ.get("BITUNIX_KEY", ""), os.environ.get("BITUNIX_SECRET", "")
+    if not (k and s):
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                c = json.load(f)
+            k, s = c.get("bitunix_key", ""), c.get("bitunix_secret", "")
+        except Exception:
+            pass
+    return (k.strip(), s.strip()) if k and s else None
+
+
+def bx_sign(key, secret, nonce, ts, query="", body=""):
+    """Firma de Bitunix: sha256(sha256(nonce + timestamp + api-key + query + body) + secret), hex en minúsculas."""
+    digest = hashlib.sha256((nonce + ts + key + query + body).encode()).hexdigest()
+    return hashlib.sha256((digest + secret).encode()).hexdigest()
+
+
+def bx_req(method, path, params=None, body=None):
+    """Petición firmada a Bitunix Futuros. Devuelve 'data' o lanza RuntimeError (el error nunca incluye las llaves)."""
+    keys = bx_keys()
+    if not keys:
+        raise RuntimeError("faltan las llaves (bitunix_key y bitunix_secret en config.json)")
+    key, secret = keys
+    params = sorted((k, str(v)) for k, v in (params or {}).items() if v is not None)
+    query = "".join(k + v for k, v in params)   # firma: clave+valor ordenados, sin = ni &
+    data = json.dumps(body, separators=(",", ":")) if body is not None else ""   # se envía exactamente lo que se firma
+    nonce, ts = uuid.uuid4().hex, str(int(time.time() * 1000))
+    req = urllib.request.Request(BX + path + ("?" + urllib.parse.urlencode(params) if params else ""),
+                                 data=data.encode() if method == "POST" else None, method=method, headers={
+        "api-key": key, "nonce": nonce, "timestamp": ts, "sign": bx_sign(key, secret, nonce, ts, query, data),
+        "Content-Type": "application/json", "language": "en-US", "User-Agent": "bridge-tactico-bot"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            j = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Bitunix HTTP {e.code}: {e.read()[:200].decode(errors='replace')}") from None
+    if j.get("code") != 0:
+        raise RuntimeError(f"Bitunix {j.get('code')}: {j.get('msg')}")
+    return j.get("data")
+
+
+def bx_pair(sym):
+    """Reglas de la moneda en Bitunix Futuros (precisión, mínimo, apalancamiento máximo). Se renuevan cada 6 h."""
+    if time.time() - _bx_pairs["t"] > 6 * 3600:
+        j = http_get(f"{BX}/api/v1/futures/market/trading_pairs", timeout=30)
+        _bx_pairs["d"] = {p["symbol"]: p for p in j.get("data") or []}
+        _bx_pairs["t"] = time.time()
+    return _bx_pairs["d"].get(sym)
+
+
+AUTO_TFS = ["15m", "2h", "4h", "8h"]   # temporalidades con mejor factor en el backtest (TF_PF ≥ 1.5)
+BX_FILE = os.path.join(BASE, "bx_state.json")   # operaciones REALES en Bitunix (archivo propio, se guarda antes de cada orden)
+_bx_lock = threading.RLock()
+_bx = {"trades": {}, "journal": [], "day": {}}
+BX_HIST = "/api/v1/futures/position/get_history_positions"
+BX_DETAIL = "/api/v1/futures/trade/get_order_detail"
+BX_FLASH = "/api/v1/futures/trade/flash_close_position"
+
+
+def bx_load():
+    try:
+        with open(BX_FILE, encoding="utf-8") as f:
+            _bx.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("⚠️ bx_state.json dañado:", e)
+
+
+def bx_save():
+    with _bx_lock:  # escritura segura: archivo temporal y luego se reemplaza
+        tmp = BX_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_bx, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, BX_FILE)
+
+
+def bx_plan(ev, info, scale=1.0, cap=AUTO_CAP, lev_cap=0):
+    """Órdenes de Bitunix para una señal OPEN (sin red: se puede probar). Devuelve (plan, motivo); sin plan no se opera."""
+    if not info or info.get("symbolStatus") != "OPEN" or info.get("isApiSupported") is False:
+        return None, "esta moneda no se puede operar por API en Bitunix"
+    qp, pp, vmin = int(info["basePrecision"]), int(info["quotePrecision"]), float(info["minTradeVolume"])
+    lev = max(int(info.get("minLeverage") or 1), min(int(ev["lev"]), int(info["maxLeverage"]), int(lev_cap) or 10 ** 6))
+    pxs = (ev["price"], ev["e2"], ev["e3"])
+    qty = [q * scale for q in ev["qty"]]
+    margin = sum(q * p for q, p in zip(qty, pxs)) / lev
+    if cap and margin > cap:  # tope de margen: las 3 entradas se achican por igual
+        qty = [q * cap / margin for q in qty]
+    legs = []
+    for n, (q, p, w) in enumerate(zip(qty, pxs, ev["w"]), 1):
+        if not w:
+            continue  # modo límite: no hay E1 a mercado
+        q = bx_fq(q, qp)   # cantidad hacia abajo: nunca más de lo calculado
+        if q < vmin:
+            return None, f"E{n} quedaría en {q:.{qp}f} y el mínimo de Bitunix es {info['minTradeVolume']} (sube /auto max)"
+        legs.append(dict(name=f"E{n}", type="MARKET" if n == 1 else "LIMIT", qty=q, price=round(p, pp)))
+    return dict(side="BUY" if ev["side"] == 1 else "SELL", lev=lev, legs=legs, sl=round(ev["sl"], pp),
+                tps=[round(t, pp) for t in ev["tps"]], margin=sum(l["qty"] * l["price"] for l in legs) / lev, qp=qp, pp=pp), ""
+
+
+def bx_fq(q, p):
+    return math.floor(q * 10 ** p + 1e-9) / 10 ** p
+
+
+def bx_cid(tid, leg):
+    """clientId fijo por operación y orden: si se reenvía, Bitunix lo rechaza como repetido (no se duplica)."""
+    return "bt" + hashlib.md5(tid.encode()).hexdigest()[:12] + leg
+
+
+def bx_text(sym, tf, plan, head, who="🤖 <b>Auto Bitunix</b>"):
+    f = lambda v, p: f"{v:.{p}f}"
+    rows = [f"├ {l['name']} {'a mercado' if l['type'] == 'MARKET' else 'límite ' + f(l['price'], plan['pp'])} · {f(l['qty'], plan['qp'])}"
+            for l in plan["legs"]]
+    return (f"{who} · {head}\n{sym} {tf} · {'LONG' if plan['side'] == 'BUY' else 'SHORT'} · "
+            f"{plan['lev']}x · margen ≈ ${plan['margin']:.2f}\n" + "\n".join(rows) +
+            f"\n├ SL {f(plan['sl'], plan['pp'])}\n└ TP {' / '.join(f(t, plan['pp']) for t in plan['tps'])} (40/30/30)")
+
+
+def bx_last(sym):
+    """Último precio en Bitunix (sin tocar _bitunix_syms, que decide el enlace del gráfico)."""
+    j = http_get(f"{BITUNIX}?{urllib.parse.urlencode({'symbol': sym, 'interval': '1m', 'limit': 1})}", timeout=20)
+    return float((j.get("data") or [{}])[-1]["close"])
+
+
+def bx_positions(sym):
+    return bx_req("GET", "/api/v1/futures/position/get_pending_positions", {"symbol": sym}) or []
+
+
+def bx_orders(sym):
+    return (bx_req("GET", "/api/v1/futures/trade/get_pending_orders", {"symbol": sym, "limit": 100}) or {}).get("orderList") or []
+
+
+def bx_cancel(sym, cids):
+    """Cancela por clientId. Devuelve los que NO se pudieron cancelar (p. ej. porque ya se llenaron)."""
+    if not cids:
+        return []
+    r = bx_req("POST", "/api/v1/futures/trade/cancel_orders", body={"symbol": sym, "orderList": [{"clientId": c} for c in cids]}) or {}
+    return [x.get("clientId") for x in r.get("failureList") or []]
+
+
+def bx_place(body):
+    """Envía una orden. Repetida (30042) = ya estaba puesta. Si la conexión falla, se consulta antes de dar error."""
+    try:
+        return bx_req("POST", "/api/v1/futures/trade/place_order", body=body)
+    except Exception as e:
+        if "30042" in str(e):
+            return {"clientId": body["clientId"]}
+        if isinstance(e, RuntimeError) and not str(e).startswith("Bitunix HTTP"):
+            raise  # Bitunix la rechazó con un código: no quedó puesta
+        try:
+            if bx_req("GET", BX_DETAIL, {"clientId": body["clientId"]}):
+                return {"clientId": body["clientId"]}
+        except Exception:
+            pass
+        raise
+
+
+def bx_say(token, owner, text):
+    try:
+        send(token, owner, text)
+    except Exception as e:
+        print("auto telegram:", e)
+
+
+def auto_signal(token, owner, st, sym, tf, ev, tid, late=False):
+    """Tras avisar una señal al administrador: filtro → límites → plan → prueba (lo muestra) o real (envía las órdenes).
+    Prueba y real siguen el mismo camino; solo cambia el último paso. Un error aquí nunca frena los avisos."""
+    live = st.get("auto") == "si"
+    if tf not in st.get("auto_tfs", AUTO_TFS):
+        return  # filtro: solo las temporalidades elegidas con /auto tf
+    try:
+        why = ""
+        if live:
+            with _bx_lock:
+                mine = list(_bx["trades"].values())
+            if _bx["day"].get("halt") == time.strftime("%Y-%m-%d"):
+                why = "se alcanzó la pérdida máxima del día"
+            elif len(mine) >= st.get("auto_ops", 1):
+                why = f"ya hay {len(mine)} operación(es) automática(s) abierta(s) (máximo: /auto ops)"
+            elif any(r["sym"] == sym for r in mine):
+                why = f"ya hay una operación automática en {sym}"
+            elif late:
+                why = "la señal llegó con retraso: no se entra tarde a mercado"
+        plan, why2 = aim_plan(st, sym, ev)
+        why = why or why2
+        if plan and not why:
+            why = bx_zone(sym, ev)
+        if why:
+            send(token, owner, f"🤖 Auto Bitunix · {sym} {tf}: no se opera ({html.escape(why)})", silent=True)
+        elif not live:
+            send(token, owner, bx_text(sym, tf, plan, "🧪 PRUEBA (no se envió nada)"), silent=True)
+        else:
+            bx_open(token, owner, st, sym, tf, ev, tid, plan)
+    except Exception as e:
+        print("auto:", sym, tf, e)
+        bx_say(token, owner, f"⚠️ Auto Bitunix · {sym} {tf}: {html.escape(str(e))[:200]}")
+
+
+def bx_open(token, owner, st, sym, tf, ev, tid, plan, manual=False):
+    """Entradas reales: E1 a mercado (si hay) y E2/E3 límite, cada una con su SL en la misma orden.
+    manual=True: la abrió el administrador con el botón 🎯 Apuntar (misma gestión que las automáticas)."""
+    who = "🎯 <b>Apuntar</b>" if manual else "🤖 <b>Auto Bitunix</b>"
+    if bx_positions(sym) or bx_orders(sym):
+        bx_say(token, owner, f"{who} · {sym} {tf}: no se opera (ya tienes posición u órdenes de {sym} en Bitunix)")
+        return
+    bx_req("POST", "/api/v1/futures/account/change_leverage", body={"symbol": sym, "leverage": plan["lev"], "marginCoin": "USDT"})
+    mg = st.get("auto_mg", "bot")  # v6.4: "strike" = BE a N R del precio medio real + parcial + BE compensado
+    rec = dict(sym=sym, tf=tf, s=ev["side"], pside="LONG" if ev["side"] == 1 else "SHORT", t0=int(time.time() * 1000),
+               legs=[dict(l, cid=bx_cid(tid, l["name"].lower())) for l in plan["legs"]], sl=plan["sl"], tps=plan["tps"],
+               qp=plan["qp"], pp=plan["pp"], be=tf in st.get("auto_be", list(ALL_TFS)) and mg != "strike", stage=0, tpv=0,
+               tp_cids={}, synced=0.0, manual=manual, mg=mg, sl0=plan["sl"], sl_hist=[plan["sl"]],
+               berr=st.get("auto_berr", 1.0), parcial=st.get("auto_parcial", 25.0), comp=st.get("auto_comp", True))
+    with _bx_lock:
+        _bx["trades"][tid] = rec
+    bx_save()  # primero se guarda y después se envía: tras un reinicio el bot sabe qué órdenes son suyas
+    errs, placed, unsure = [], 0, 0
+    for l in rec["legs"]:
+        body = {"symbol": sym, "side": plan["side"], "tradeSide": "OPEN", "qty": f"{l['qty']:.{plan['qp']}f}",
+                "orderType": l["type"], "clientId": l["cid"], "slPrice": f"{plan['sl']:.{plan['pp']}f}",
+                "slStopType": "LAST_PRICE", "slOrderType": "MARKET"}
+        if l["type"] == "LIMIT":
+            body.update(price=f"{l['price']:.{plan['pp']}f}", effect="GTC")
+        try:
+            bx_place(body)
+            placed += 1
+        except Exception as e:
+            errs.append(f"{l['name']}: {e}")
+            if not (isinstance(e, RuntimeError) and str(e).startswith("Bitunix ") and not str(e).startswith("Bitunix HTTP")):
+                unsure += 1  # no hubo respuesta clara: puede que SÍ haya entrado (el hilo de gestión lo verá)
+            if l["type"] == "MARKET":
+                break  # sin E1 no se ponen E2/E3
+    if not placed and not unsure:  # rechazo claro de Bitunix: no quedó nada abierto
+        with _bx_lock:
+            _bx["trades"].pop(tid, None)
+        bx_save()
+    head = ("💸 REAL · órdenes enviadas" if placed else "⚠️ REAL · sin respuesta clara de Bitunix: lo reviso en 10 s" if unsure
+            else "⚠️ REAL · Bitunix rechazó las órdenes")
+    bx_say(token, owner, bx_text(sym, tf, plan, head, who) + "".join(f"\n⚠️ {html.escape(e)[:150]}" for e in errs))
+
+
+def bx_flag(tid, k):
+    with _bx_lock:
+        r = _bx["trades"].get(tid)
+        if r:
+            r[k] = True
+
+
+def bx_drop(tid):
+    with _bx_lock:
+        _bx["trades"].pop(tid, None)
+
+
+def bx_move_sl(sym, pid, sls, price, pp):
+    """Mueve todos los stops de la posición a 'price'. Devuelve los errores."""
+    errs, px = [], f"{price:.{pp}f}"
+    for t in sls:
+        try:
+            if t.get("slQty"):
+                bx_req("POST", "/api/v1/futures/tpsl/modify_order", body={"orderId": t["id"], "slPrice": px,
+                                                                           "slStopType": "LAST_PRICE", "slQty": t["slQty"]})
+            else:
+                bx_req("POST", "/api/v1/futures/tpsl/position/modify_order", body={"symbol": sym, "positionId": pid,
+                                                                                    "slPrice": px, "slStopType": "LAST_PRICE"})
+        except Exception as e:
+            errs.append(str(e))
+    return errs
+
+
+def bx_step(token, owner, st, tid, r, positions, pend):
+    """Una operación real contra lo que HAY en Bitunix (no contra la simulación del bot)."""
+    say = lambda t: bx_say(token, owner, t)
+    sym, now, name = r["sym"], time.time(), f"{r['sym']} {r['tf']}"
+    pos = next((p for p in positions if p.get("side") == r["pside"]), None)
+    entry = [l["cid"] for l in r["legs"]]
+    resting = lambda cids: [c for c in cids if c in pend]
+    tr = st.get("trades", {}).get(tid, {})
+    if not pos and any(p.get("side") not in ("LONG", "SHORT") for p in positions):
+        st["auto"] = ""  # Bitunix nombra el lado de otra forma que la documentación: no se adivina
+        if not r.get("side_err"):
+            r["side_err"] = True
+            say(f"🚨 <b>REAL Bitunix</b> · {name}: no reconozco el lado de la posición ({html.escape(str(positions[0].get('side')))}). "
+                "Apagué el modo automático; revisa la posición en Bitunix.")
+        return
+    if not pos:
+        if r.get("pid"):  # existió y ya no está: se confirma con el historial antes de darla por cerrada
+            h = (bx_req("GET", BX_HIST, {"symbol": sym, "positionId": r["pid"]}) or {}).get("positionList") or []
+            h = [p for p in h if p.get("positionId") == r["pid"]]
+            if not h:
+                r["miss"] = r.get("miss", 0) + 1
+                if r["miss"] == 30:  # ~5 min sin verla abierta ni en el historial
+                    say(f"⚠️ REAL Bitunix · {name}: no veo la posición ni en el historial. Revisa Bitunix; sigo mirando.")
+                return
+            bx_cancel(sym, resting(entry + list(r["tp_cids"].values())))
+            p = h[0]
+            with _bx_lock:
+                _bx["journal"] = (_bx["journal"] + [dict(tid=tid, sym=sym, tf=r["tf"], t=int(now * 1000), pnl=p.get("realizedPNL"),
+                                                         fee=p.get("fee"), funding=p.get("funding"), tp=r["stage"])])[-1000:]
+            say(f"🏁 <b>REAL Bitunix</b> · {name} cerrada (TP alcanzados: {r['stage']}/3)\n"
+                f"PnL {float(p.get('realizedPNL') or 0):+.2f} USDT · comisiones {p.get('fee')} · funding {p.get('funding')}\n"
+                f"Entrada {p.get('entryPrice')} → salida {p.get('closePrice')}")
+            bx_drop(tid)
+        elif now * 1000 - r["t0"] > 30_000:  # (margen para que Bitunix muestre la posición tras la orden a mercado)
+            left = resting(entry)
+            old = now * 1000 - r["t0"] > 300 * TF_MS.get(r["tf"], 900_000)
+            if not left or r.get("cancel") or tr.get("cancelled") or tr.get("closed") or old:
+                if bx_cancel(sym, left):
+                    return  # alguna se llenó justo ahora: la próxima vuelta verá la posición
+                say(f"🤖 REAL Bitunix · {name}: " + ("órdenes de entrada canceladas (la señal ya no vale)" if left else
+                                                      "sin posición ni órdenes pendientes: se deja de seguir"))
+                bx_drop(tid)
+        return
+    q, pid = float(pos["qty"]), pos["positionId"]
+    r["pid"], r["miss"] = pid, 0
+    if r.get("soltada"):
+        return  # v6.4: la cambiaste a mano en Bitunix → el bot no toca nada (solo avisa cuando se cierre)
+    if r.get("exit"):  # el bot cerró por señal contraria: se cierra todo a mercado
+        bx_req("POST", BX_FLASH, body={"positionId": pid})
+        r["exit"] = False
+        say(f"🔄 <b>REAL Bitunix</b> · {name}: señal contraria, posición cerrada a mercado")
+        return
+    tick, tq = 10 ** -r["pp"], 10 ** -r["qp"]
+
+    def cxl(cids):  # cancelación hecha por el bot (para no confundirla con una tuya)
+        r.setdefault("bot_cxl", []).extend(c for c in cids if c not in r["bot_cxl"])
+        return bx_cancel(sym, cids)
+
+    # 1) Stop confirmado: la posición nunca queda sin SL
+    sls = [t for t in bx_req("GET", "/api/v1/futures/tpsl/get_pending_orders", {"symbol": sym, "positionId": pid}) or []
+           if t.get("slPrice")]
+    # 0) v6.4 · ¿la cambiaste a mano? Un SL en un precio que el bot nunca puso → se suelta.
+    #    (solo operaciones abiertas desde v6.4: las anteriores no tienen el historial de SL y se gestionan como antes)
+    v64 = "sl0" in r
+    hist = r.setdefault("sl_hist", [r["sl"]] + ([r["be_px"]] if r.get("be_px") else []))
+    moved = [t for t in sls if all(abs(float(t["slPrice"]) - h) > tick / 2 for h in hist)] if v64 else []
+    if moved:
+        bx_soltar(token, owner, tid, r, f"moviste el SL a {moved[0]['slPrice']}")
+        return
+    covered = any(not t.get("slQty") for t in sls) or sum(float(t["slQty"]) for t in sls if t.get("slQty")) >= q * 0.999
+    if not covered:
+        r.setdefault("nocov", now)
+        try:
+            bx_req("POST", "/api/v1/futures/tpsl/position/place_order", body={"symbol": sym, "positionId": pid,
+                                                                               "slPrice": f"{r['sl']:.{r['pp']}f}", "slStopType": "LAST_PRICE"})
+        except Exception as e:
+            print("auto SL:", sym, e)
+        if now - r["nocov"] > 45:
+            bx_req("POST", BX_FLASH, body={"positionId": pid})
+            st["auto"] = ""
+            say(f"🚨 <b>REAL Bitunix</b> · {name}: no pude confirmar el stop loss en 45 s. Cerré la posición a mercado y "
+                "<b>apagué el modo automático</b> (/auto). Revisa Bitunix.")
+        return
+    r.pop("nocov", None)
+    avg = float(pos.get("avgOpenPrice") or 0)
+    filled_q = lambda det: float(det.get("tradeQty") or det.get("qty") or 0)
+    # v6.4: lo que cierran las órdenes del bot (TP y parcial) es "crédito": si la posición baja más que eso, fuiste tú
+    seen_tq = r.setdefault("tq", {})
+    for c in list(r["tp_cids"].values()) + ([r["pcid"]] if r.get("pcid") else []):
+        if c in pend:
+            now_tq = float(pend[c].get("tradeQty") or 0)
+            r["credit"] = r.get("credit", 0.0) + max(0.0, now_tq - seen_tq.get(c, 0.0))
+            seen_tq[c] = now_tq
+    # 2) TP que ya no están pendientes: llenados (o cancelados por Bitunix → se vuelven a poner)
+    for k in range(r["stage"], 3):
+        c = r["tp_cids"].get(str(k))
+        if not c or c in pend:
+            continue
+        try:
+            det = bx_req("GET", BX_DETAIL, {"clientId": c}) or {}
+        except Exception:
+            continue  # sin respuesta: se vuelve a mirar en 10 s
+        status = det.get("status")
+        r["tp_cids"].pop(str(k))
+        got = filled_q(det) if status == "FILLED" else float(det.get("tradeQty") or 0)
+        r["credit"] = r.get("credit", 0.0) + max(0.0, got - seen_tq.pop(c, 0.0))
+        if status != "FILLED":
+            r["synced"] = 0.0
+            continue
+        r["stage"] = k + 1
+        if k == 0 and r["be"]:  # TP1: stop a la entrada (+0.08 % para comisiones) y ya no se compran E2/E3
+            cxl(resting(entry))
+            if avg > 0:
+                r["be_px"] = r["sl"] = round(avg * (1 + r["s"] * 0.0008), r["pp"])
+                hist.append(r["be_px"])
+        say(f"✅ <b>REAL Bitunix</b> · {name}: TP{k + 1} ejecutado")
+    # 2a) v6.4 · ¿cancelaste a mano una entrada límite (E2/E3)? → se suelta
+    done = r.setdefault("edone", [])
+    for c in entry if v64 else []:
+        if c in pend or c in done:
+            continue
+        try:
+            det = bx_req("GET", BX_DETAIL, {"clientId": c})
+        except Exception:
+            continue
+        status = (det or {}).get("status")
+        if not det or status == "FILLED" or c in r.get("bot_cxl", []):
+            done.append(c)
+        elif status == "CANCELED":
+            bx_soltar(token, owner, tid, r, f"cancelaste la entrada {c[-2:].upper()}")
+            return
+    # 2b) v6.4 · modo STRIKE: al llegar a N R desde el precio medio REAL → SL a break even + cierre parcial
+    just_placed = False
+    if r.get("mg") == "strike" and not r.get("bek") and avg > 0:
+        R = abs(avg - r.get("sl0", r["sl"]))
+        px = bx_last(sym) if R > 0 else 0
+        if R > 0 and r["s"] * (px - avg) >= r.get("berr", 1.0) * R:
+            r["bek"] = True
+            cxl(resting(entry))  # ya no se compran más E2/E3
+            r["be_px"] = r["sl"] = round(avg * (1 + r["s"] * 0.0008), r["pp"])
+            hist.append(r["be_px"])
+            info = bx_pair(sym)
+            vmin = float(info["minTradeVolume"]) if info else 0.0
+            qp_ = bx_fq(q * r.get("parcial", 25.0) / 100, r["qp"])
+            part = ""
+            if r.get("parcial", 25.0) > 0 and max(vmin, tq / 2) <= qp_ < q:
+                if not cxl(resting(list(r["tp_cids"].values()))):  # primero se quitan los TP (se rehacen con la cantidad nueva)
+                    r["tp_cids"], r["synced"] = {}, 0.0
+                    cid = bx_cid(tid, "pbe")
+                    try:
+                        bx_place({"symbol": sym, "side": "BUY" if r["pside"] == "LONG" else "SELL", "tradeSide": "CLOSE",
+                                  "positionId": pid, "qty": f"{qp_:.{r['qp']}f}", "orderType": "MARKET", "clientId": cid})
+                        r["pcid"], just_placed = cid, True
+                        part = f" y cierre parcial del {r.get('parcial', 25.0):g} % ({qp_:.{r['qp']}f})"
+                    except Exception as e:
+                        part = f" (el parcial falló: {html.escape(str(e))[:120]})"
+            say(f"🛟 <b>REAL Bitunix</b> · {name}: llegó a {r.get('berr', 1.0):g} R → SL a break even ({r['be_px']}){part}")
+    # 2c) BE compensado: cuando el parcial se ejecutó, el SL baja (sube en SHORT) lo justo para que, si salta,
+    #     lo que pierde el resto se compense con lo que ganó el parcial (resultado total ≈ 0, comisiones de cierre incluidas)
+    if r.get("pcid") and not r.get("pdone") and not just_placed and r["pcid"] not in pend:  # (con la cantidad ya reducida)
+        try:
+            det = bx_req("GET", BX_DETAIL, {"clientId": r["pcid"]})
+        except Exception:
+            det = None
+        if det is not None:
+            r["pdone"] = True
+            if det.get("status") == "FILLED":
+                r["credit"] = r.get("credit", 0.0) + max(0.0, filled_q(det) - seen_tq.pop(r["pcid"], 0.0))
+                gain = float(det.get("realizedPNL") or 0) - abs(float(det.get("fee") or 0))
+                if r.get("comp", True) and gain > 0 and q > 0 and avg > 0:
+                    slc = avg - r["s"] * (gain / q - avg * FEE_TAKER)
+                    lo, hi = sorted((r.get("sl0", r["sl"]), r["be_px"]))
+                    slc = round(min(max(slc, lo), hi), r["pp"])  # nunca más allá del SL original ni del BE normal
+                    if abs(slc - r["be_px"]) > tick / 2:
+                        r["be_px"] = r["sl"] = slc
+                        hist.append(slc)
+                        say(f"🛟 <b>REAL Bitunix</b> · {name}: BE compensado → SL a {slc} (si salta, el parcial "
+                            f"de +{gain:.2f} USDT compensa el resto: resultado ≈ 0)")
+    # 2d) v6.4 · ¿cerraste una parte a mano? La posición bajó más de lo que cerraron las órdenes del bot → se suelta
+    ql = r.get("q_last") if v64 else None
+    if ql is not None and q < ql - tq / 2:
+        if ql - q > r.get("credit", 0.0) + tq / 2:
+            bx_soltar(token, owner, tid, r, "cerraste una parte de la posición")
+            return
+        r["credit"] = max(0.0, r.get("credit", 0.0) - (ql - q))
+    r["q_last"] = q
+    # 2b) Break even: se insiste hasta que TODOS los stops de la posición estén en la entrada
+    if r.get("be_px"):
+        wrong = [t for t in sls if abs(float(t["slPrice"]) - r["be_px"]) > 10 ** -r["pp"] / 2]
+        if wrong:
+            errs = bx_move_sl(sym, pid, wrong, r["be_px"], r["pp"])
+            if not errs:
+                say(f"🛟 <b>REAL Bitunix</b> · {name}: SL movido a break even ({r['be_px']})")
+            elif not r.get("be_err"):
+                r["be_err"] = True
+                say(f"⚠️ REAL Bitunix · {name}: no se pudo mover el SL a break even (reintento cada 10 s): {html.escape(errs[0])[:150]}")
+    # 3) TP sobre la cantidad REAL abierta (si entró E2/E3 se rehacen)
+    if r["stage"] < 3 and abs(q - r["synced"]) > 10 ** -r["qp"] / 2:
+        if bx_cancel(sym, resting(list(r["tp_cids"].values()))):
+            return  # alguno no se pudo cancelar (¿se llenó?): se revisa en la próxima vuelta
+        info = bx_pair(sym)
+        vmin = float(info["minTradeVolume"]) if info else 0.0
+        r["tp_cids"], r["tpv"] = {}, r["tpv"] + 1
+        todo = list(range(r["stage"], 3))
+        rest, carry, errs = q, 0.0, []
+        for i, k in enumerate(todo):
+            last = i == len(todo) - 1
+            qk = bx_fq(rest if last else q * TP_SPLIT[k] / sum(TP_SPLIT[j] for j in todo) + carry, r["qp"])
+            if qk < vmin or qk <= 0:
+                carry = qk  # muy poco para Bitunix: pasa al TP siguiente
+                continue
+            carry, rest = 0.0, rest - qk
+            cid = bx_cid(tid, f"t{k}v{r['tpv']}")
+            try:  # cierre parcial con límite: side = lado de la posición + tradeSide CLOSE (así lo indica Bitunix)
+                bx_place({"symbol": sym, "side": "BUY" if r["pside"] == "LONG" else "SELL", "tradeSide": "CLOSE", "positionId": pid,
+                          "qty": f"{qk:.{r['qp']}f}", "orderType": "LIMIT", "price": f"{r['tps'][k]:.{r['pp']}f}", "effect": "GTC",
+                          "clientId": cid})
+                r["tp_cids"][str(k)] = cid
+            except Exception as e:
+                errs.append(f"TP{k + 1}: {e}")
+        r["synced"] = q
+        if errs:
+            say(f"⚠️ <b>REAL Bitunix</b> · {name}: el SL sigue puesto, pero no se pudieron poner estos TP:\n" +
+                "\n".join(html.escape(e)[:150] for e in errs))
+
+
+def bx_manage(token, owner, st):
+    """Cada 10 s (hilo propio, no depende de la revisión de velas): cada operación real contra lo que hay en Bitunix."""
+    with _bx_lock:
+        items = list(_bx["trades"].items())
+    seen = {}
+    for tid, r in items:
+        try:
+            if r["sym"] not in seen:
+                seen[r["sym"]] = (bx_positions(r["sym"]), {o.get("clientId"): o for o in bx_orders(r["sym"])})
+            with _bx_lock:  # (el hilo principal también guarda este estado)
+                bx_step(token, owner, st, tid, r, *seen[r["sym"]])
+        except Exception as e:
+            print("auto gestión:", r["sym"], e)
+            if time.time() - r.get("err_t", 0) > 600:  # máximo un aviso cada 10 min por operación
+                r["err_t"] = time.time()
+                bx_say(token, owner, f"⚠️ REAL Bitunix · {r['sym']} {r['tf']}: {html.escape(str(e))[:200]}")
+    bx_save()
+
+
+def bx_guard(token, owner, st):
+    """Pérdida máxima del día: si el capital de la cuenta cae más de /auto perdida %, no se abren operaciones nuevas hoy."""
+    acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+    eq = sum(float(acc.get(k) or 0) for k in ("available", "frozen", "margin", "crossUnrealizedPNL", "isolationUnrealizedPNL"))
+    day, d = time.strftime("%Y-%m-%d"), _bx["day"]
+    if d.get("d") != day:
+        with _bx_lock:
+            d.update(d=day, eq0=eq)
+    lim = st.get("auto_loss", 5)
+    if d.get("eq0") and eq < d["eq0"] * (1 - lim / 100) and d.get("halt") != day:
+        d["halt"] = day
+        bx_say(token, owner, f"🛑 <b>Auto Bitunix</b>: la cuenta bajó más de {lim:g} % hoy ({d['eq0']:.2f} → {eq:.2f} USDT). "
+                             "No se abren operaciones nuevas hasta mañana; las abiertas siguen con su SL y TP.")
+    bx_save()
+
+
+def bx_loop(token, owner, st):
+    t_guard = t_seg = 0.0
+    while True:
+        time.sleep(10)
+        if not (_leading.is_set() and bx_keys()):
+            continue
+        try:
+            if _bx["trades"]:
+                bx_manage(token, owner, st)
+            if (st.get("auto") == "si" or st.get("aim_mode") == "si") and time.time() - t_guard > 300:
+                t_guard = time.time()
+                bx_guard(token, owner, st)
+            if st.get("seguro", True) and time.time() - t_seg > 60:  # v6.4: seguro de riesgo cada minuto
+                t_seg = time.time()
+                bx_seguro(token, owner, st)
+        except Exception as e:
+            print("auto:", e)
+
+
+def auto_arm_error(st):
+    """Por qué no se puede activar el modo real (texto vacío = se puede)."""
+    if not bx_keys():
+        return f"faltan las llaves de Bitunix en este equipo [{HOST}]"
+    if not (st.get("auto_capital") and st.get("auto_risk")):
+        return "primero define cuánto administra: /auto capital 500 y /auto riesgo 1"
+    try:
+        pm = (bx_req("GET", "/api/v1/futures/account/position_mode") or {}).get("positionMode")
+    except Exception as e:
+        return f"no pude leer tu cuenta: {e}"
+    if pm != "HEDGE":
+        return f"tu cuenta está en modo {pm}; el bot opera en HEDGE. Cámbialo con /bitunix hedge (sin posiciones ni órdenes abiertas)"
+    return ""
+
+
+def auto_status(st):
+    mode = {"si": "💸 <b>REAL</b>", "prueba": "🧪 PRUEBA (muestra las órdenes, no envía nada)"}.get(st.get("auto"), "apagado")
+    cap, risk = st.get("auto_capital", 0), st.get("auto_risk", 0)
+    with _bx_lock:
+        rows = [f"• {r['sym']} {r['tf']} {'LONG' if r['s'] == 1 else 'SHORT'} · TP {r['stage']}/3" for r in _bx["trades"].values()]
+    be = st.get("auto_be", list(ALL_TFS))
+    return (f"🤖 <b>Auto Bitunix</b> [{HOST}]: {mode}\n"
+            f"💰 Capital: ${cap:g} · riesgo {risk:g} % = ${cap * risk / 100:g} por operación\n"
+            f"⏱ Temporalidades: {', '.join(st.get('auto_tfs', AUTO_TFS))}\n"
+            f"🔢 Máx. operaciones: {st.get('auto_ops', 1)} · margen máx: ${st.get('auto_max', AUTO_CAP):g} · "
+            f"apalancamiento máx: {st.get('auto_lev', 0) or 'el de la señal'}\n"
+            f"🛑 Pérdida máxima diaria: {st.get('auto_loss', 5):g} % · 🛟 BE tras TP1: {', '.join(be) if be else 'no'}\n"
+            + (f"🎯 Gestión STRIKE: BE a {st.get('auto_berr', 1.0):g} R del precio medio real · parcial "
+               f"{st.get('auto_parcial', 25.0):g} % · BE compensado {'sí' if st.get('auto_comp', True) else 'no'} "
+               "(sin TP1→BE; no está en el backtest)\n" if st.get("auto_mg") == "strike" else "🎯 Gestión: la del bot (TP1 → BE)\n")
+            + ("📂 Abiertas:\n" + "\n".join(rows) + "\n" if rows else "") +
+            "\n/auto prueba · /auto si · /auto no\n/auto capital 500 · /auto riesgo 1 · /auto ops 1 · /auto max 10\n"
+            "/auto perdida 5 · /auto lev 20 · /auto tf 2h 4h 8h · /auto be si|no|15m 4h\n"
+            "/auto gestion bot|strike · /auto berr 1 · /auto parcial 25 · /auto compensado si|no")
+
+
+# ----------------------------- v6.4 · TIPO "STRIKE": APUNTAR · POSICIONES · SEGURO DE RIESGO · SOLTAR -----------------------------
+AIM_KEEP = 40      # señales recientes que se pueden apuntar con el botón 🎯
+AIM_CONFIRM = 90   # segundos para confirmar después de pulsar 🎯
+
+
+def aim_on(st):
+    """El botón 🎯 aparece si este equipo tiene llaves de Bitunix y /apuntar no está apagado."""
+    return not CLOUD and st.get("aim_mode", "prueba") != "no" and bool(bx_keys())
+
+
+def aim_store(st, tid, sym, tf, ev, ct):
+    a = st.setdefault("aim", {})
+    a[tid] = dict(sym=sym, tf=tf, ev=ev, ct=ct)
+    for k in sorted(a, key=lambda k: a[k]["ct"])[:-AIM_KEEP]:
+        del a[k]
+
+
+def aim_plan(st, sym, ev):
+    """Órdenes con el capital y el riesgo de /auto (las mismas cuentas que el modo automático)."""
+    risk_usd = st.get("auto_capital", 0) * st.get("auto_risk", 0) / 100
+    scale = risk_usd / ev["risk"] if risk_usd and ev.get("risk") else user_scale(st, "owner")
+    return bx_plan(ev, bx_pair(sym), scale, st.get("auto_max", AUTO_CAP), st.get("auto_lev", 0))
+
+
+def bx_zone(sym, ev, chase=False):
+    """Por qué el precio actual de Bitunix ya no sirve para entrar ('' = sirve).
+    chase=True (botón 🎯): además no se persigue el precio si ya recorrió media distancia al TP1 (entrada a mercado)."""
+    px = bx_last(sym)
+    if abs(px / ev["price"] - 1) > 0.03:  # p. ej. otra unidad de contrato (1000…) o datos raros
+        return f"el precio en Bitunix ({px:g}) es muy distinto al de la señal ({ev['price']:g})"
+    if not (ev["sl"] < px < ev["tps"][0] if ev["side"] == 1 else ev["tps"][0] < px < ev["sl"]):
+        return f"el precio en Bitunix ({px:g}) ya salió de la zona entre el SL y el TP1"
+    gone = (px - ev["price"]) / (ev["tps"][0] - ev["price"]) if ev["tps"][0] != ev["price"] else 0
+    if chase and gone >= 0.5 and not ev.get("limit"):
+        return f"el precio ({px:g}) ya recorrió más de la mitad del camino al TP1: no se persigue"
+    return ""
+
+
+def aim_check(st, tid, a):
+    """Motivo para NO apuntar ('' = se puede)."""
+    if int(time.time() * 1000) - a["ct"] > 3 * TF_MS.get(a["tf"], 900_000) + 120_000:
+        return "la señal ya tiene más de 3 velas"
+    with _bx_lock:
+        mine = list(_bx["trades"].items())
+    if any(t == tid for t, _ in mine):
+        return "esa señal ya está abierta en Bitunix"
+    if any(r["sym"] == a["sym"] for _, r in mine):
+        return f"ya hay una operación del bot en {a['sym']}"
+    if _bx["day"].get("halt") == time.strftime("%Y-%m-%d"):
+        return "se alcanzó la pérdida máxima del día (/auto perdida)"
+    return bx_zone(a["sym"], a["ev"], chase=True)
+
+
+def plan_risk(plan):
+    """USDT que se pierden si todas las entradas se llenan y salta el SL."""
+    return sum(l["qty"] * abs(l["price"] - plan["sl"]) for l in plan["legs"])
+
+
+def aim_risk_line(st, plan):
+    lim = st.get("seguro_lim", 5.0)
+    try:
+        rows, eq = bx_portfolio()
+    except Exception:
+        return f"\n🛡 Riesgo de esta operación: ${plan_risk(plan):.2f}"
+    now_r = sum(x["risk"] or 0 for x in rows)
+    a, b = (now_r / eq * 100, (now_r + plan_risk(plan)) / eq * 100) if eq else (0, 0)
+    warn = f"\n⚠️ <b>Pasarías tu límite de riesgo ({lim:g} %)</b>" if st.get("seguro", True) and b > lim else ""
+    return f"\n🛡 Riesgo abierto: {a:.1f} % → {b:.1f} % de la cuenta (esta operación: ${plan_risk(plan):.2f}){warn}"
+
+
+def aim_press(token, owner, st, tid):
+    """Botón 🎯: muestra el plan con TUS límites y pide confirmar (nada se envía todavía)."""
+    a = st.get("aim", {}).get(tid)
+    if not a:
+        return "Esa señal ya no está disponible"
+    mode = st.get("aim_mode", "prueba")
+    try:
+        plan, why = aim_plan(st, a["sym"], a["ev"])
+        why = why or aim_check(st, tid, a)
+        if why:
+            send(token, owner, f"🎯 {a['sym']} {a['tf']}: no se puede apuntar ({html.escape(why)})")
+            return "No se puede apuntar"
+        a["ask"] = time.time()
+        head = ("💸 REAL" if mode == "si" else "🧪 PRUEBA (no se enviará nada)") + " · ¿confirmas?"
+        send(token, owner, bx_text(a["sym"], a["tf"], plan, head, "🎯 <b>Apuntar</b>") + aim_risk_line(st, plan) +
+             f"\n⏱ Tienes {AIM_CONFIRM} s para confirmar.", [[("✅ Confirmar", "apc:" + tid), ("❌ Cancelar", "apx:" + tid)]])
+        return ""
+    except Exception as e:
+        send(token, owner, f"⚠️ 🎯 {a['sym']} {a['tf']}: {html.escape(str(e))[:200]}")
+        return "Error"
+
+
+def aim_confirm(token, owner, st, tid):
+    """✅ Confirmar: se revisa todo otra vez (el precio pudo moverse) y se envía (REAL) o se muestra (PRUEBA)."""
+    a = st.get("aim", {}).get(tid)
+    if not a or not a.get("ask") or time.time() - a["ask"] > AIM_CONFIRM:
+        return "La confirmación venció: vuelve a pulsar 🎯"
+    a.pop("ask", None)
+    mode = st.get("aim_mode", "prueba")
+    try:
+        plan, why = aim_plan(st, a["sym"], a["ev"])
+        why = why or aim_check(st, tid, a) or (auto_arm_error(st) if mode == "si" else "")
+        if why:
+            send(token, owner, f"🎯 {a['sym']} {a['tf']}: no se envió ({html.escape(why)})")
+        elif mode != "si":
+            send(token, owner, bx_text(a["sym"], a["tf"], plan, "🧪 PRUEBA (no se envió nada · /apuntar si para operar de verdad)",
+                                       "🎯 <b>Apuntar</b>"))
+        else:
+            bx_open(token, owner, st, a["sym"], a["tf"], a["ev"], tid, plan, manual=True)
+        return ""
+    except Exception as e:
+        send(token, owner, f"⚠️ 🎯 {a['sym']} {a['tf']}: {html.escape(str(e))[:200]}")
+        return "Error"
+
+
+def bx_soltar(token, owner, tid, r, why):
+    """La cambiaste a mano en Bitunix: el bot deja de tocarla (como STRIKE) hasta que la devuelvas."""
+    r["soltada"] = True
+    try:
+        send(token, owner, f"✋ <b>Soltada</b> · {r['sym']} {r['tf']}: {html.escape(why)} en Bitunix, así que el bot ya no la toca "
+                           "(queda en tus manos: SL, TP y cierre los manejas tú).", [[("↩️ Devolver al bot", "dv:" + tid)]])
+    except Exception as e:
+        print("soltar:", e)
+
+
+def bx_devolver(tid):
+    """↩️ El bot vuelve a gestionarla y ADOPTA lo que hay ahora en Bitunix (tu SL y la cantidad actual)."""
+    with _bx_lock:
+        r = _bx["trades"].get(tid)
+        if not r:
+            return "Esa operación ya no está abierta"
+        if not r.get("soltada"):
+            return "El bot ya la está gestionando"
+        if r.get("pid"):
+            sls = [float(t["slPrice"]) for t in bx_req("GET", "/api/v1/futures/tpsl/get_pending_orders",
+                                                       {"symbol": r["sym"], "positionId": r["pid"]}) or [] if t.get("slPrice")]
+            if sls:
+                r["sl"] = sls[0]
+                r.pop("be_px", None)
+            r.setdefault("sl_hist", []).extend(sls)
+        r.update(soltada=False, synced=0.0, q_last=None, credit=0.0, edone=[l["cid"] for l in r["legs"]])
+    bx_save()
+    return "↩️ El bot vuelve a gestionarla"
+
+
+def bx_portfolio():
+    """Todas tus posiciones en Bitunix (del bot o no) con el riesgo hasta su SL. Devuelve (filas, capital de la cuenta)."""
+    acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+    eq = sum(float(acc.get(k) or 0) for k in ("available", "frozen", "margin", "crossUnrealizedPNL", "isolationUnrealizedPNL"))
+    with _bx_lock:
+        mine = {r["pid"]: (t, r) for t, r in _bx["trades"].items() if r.get("pid")}
+    rows = []
+    for p in bx_req("GET", "/api/v1/futures/position/get_pending_positions") or []:
+        q, avg = float(p.get("qty") or 0), float(p.get("avgOpenPrice") or 0)
+        s = 1 if p.get("side") == "LONG" else -1
+        sls = [t for t in bx_req("GET", "/api/v1/futures/tpsl/get_pending_orders",
+                                 {"symbol": p["symbol"], "positionId": p["positionId"], "limit": 100}) or [] if t.get("slPrice")]
+        risk = sl = None
+        if sls:
+            dist = [max(0.0, s * (avg - float(t["slPrice"]))) for t in sls]
+            risk = min(sum((float(t["slQty"]) if t.get("slQty") else q) * d for t, d in zip(sls, dist)), q * max(dist))
+            sl = float(sls[0]["slPrice"])
+        tid, r = mine.get(p["positionId"], (None, None))
+        rows.append(dict(sym=p.get("symbol"), side=p.get("side"), q=q, avg=avg, lev=p.get("leverage"),
+                         pnl=float(p.get("unrealizedPNL") or 0), margin=float(p.get("margin") or 0), sl=sl, risk=risk, tid=tid, r=r))
+    return rows, eq
+
+
+def positions_report(st):
+    """/posiciones: como el panel de STRIKE (PnL no realizado, riesgo abierto, quién la gestiona)."""
+    rows, eq = bx_portfolio()
+    head = f"📂 <b>Posiciones en Bitunix</b> [{HOST}]"
+    if not rows:
+        return f"{head}\nNo tienes posiciones abiertas · capital ${eq:,.2f}", None
+    lines, buttons = [head], []
+    for x in rows:
+        r = x["r"]
+        if r:
+            who = "✋ soltada (la manejas tú)" if r.get("soltada") else (
+                ("🎯 apuntada" if r.get("manual") else "🤖 auto") + f" · {r['tf']} · TP {r['stage']}/3" + (" · 🛟 BE" if r.get("be_px") else ""))
+            if r.get("soltada"):
+                buttons.append([(f"↩️ Devolver {x['sym']} al bot", "dv:" + x["tid"])])
+        else:
+            who = "👤 tuya (el bot no la gestiona)"
+        pct = x["pnl"] / x["margin"] * 100 if x["margin"] else 0.0
+        risk = "⚠️ SIN stop loss" if x["risk"] is None else f"riesgo ${x['risk']:.2f}"
+        lines.append(f"\n{'🟢 LONG' if x['side'] == 'LONG' else '🔴 SHORT'} <b>{x['sym']}</b> {x['lev']}x · {who}\n"
+                     f"   {fq(x['q'])} @ {fmt(x['avg'])} · PnL <b>{x['pnl']:+.2f}</b> USDT ({pct:+.1f} % del margen)\n"
+                     f"   SL {fmt(x['sl']) if x['sl'] else '—'} · {risk}")
+    tot, rk = sum(x["pnl"] for x in rows), sum(x["risk"] or 0 for x in rows)
+    pr, lim = (rk / eq * 100 if eq else 0.0), st.get("seguro_lim", 5.0)
+    over = st.get("seguro", True) and pr > lim
+    lines.append(f"\n💰 No realizado: <b>{tot:+.2f}</b> USDT · capital ${eq:,.2f}\n"
+                 f"🛡 Riesgo abierto: <b>{pr:.1f} %</b> (${rk:.2f}) · " + (f"⚠️ pasa tu límite de {lim:g} %" if over else f"límite {lim:g} %"))
+    return "\n".join(lines), buttons or None
+
+
+def bx_seguro(token, owner, st):
+    """Seguro de riesgo: aviso si el riesgo abierto (lo que pierdes si saltan todos los SL) pasa del límite, o si hay
+    una posición sin SL. Avisa de nuevo si sube 1 punto más o pasada 1 hora."""
+    rows, eq = bx_portfolio()
+    rk = sum(x["risk"] or 0 for x in rows)
+    pr, lim = (rk / eq * 100 if eq else 0.0), st.get("seguro_lim", 5.0)
+    if pr > lim and (pr >= st.get("seguro_alert", 0) + 1 or time.time() - st.get("seguro_t", 0) > 3600):
+        st["seguro_alert"], st["seguro_t"] = pr, time.time()
+        bx_say(token, owner, f"🛡 <b>Seguro de riesgo</b>: tu riesgo abierto en Bitunix es <b>{pr:.1f} %</b> de la cuenta "
+                             f"(${rk:.2f} de ${eq:,.2f}), más que tu límite de {lim:g} %.\n/posiciones para ver el detalle.")
+    elif pr <= lim:
+        st["seguro_alert"] = 0
+    warned = st.setdefault("seguro_nosl", [])
+    open_ids = [f"{x['sym']}_{x['side']}" for x in rows]
+    for x in rows:
+        k = f"{x['sym']}_{x['side']}"
+        if x["risk"] is None and k not in warned and not (x["r"] and not x["r"].get("soltada")):  # las del bot ya se protegen solas
+            warned.append(k)
+            bx_say(token, owner, f"🛡 <b>Seguro de riesgo</b>: tu posición {x['side']} de {x['sym']} en Bitunix <b>no tiene stop loss</b>.")
+    st["seguro_nosl"] = [k for k in warned if k in open_ids]
+
+
+def deliver(token, owner, st, uids, sym, tf, ev, extra=None, per_user=None, tid=None):
     """Envía un aviso a cada usuario con su propio capital/riesgo. Devuelve a quién llegó.
-    per_user = {uid: datos extra solo para ese usuario} (p. ej. cuántas operaciones tiene abiertas)."""
+    per_user = {uid: datos extra solo para ese usuario} (p. ej. cuántas operaciones tiene abiertas).
+    tid (solo señales nuevas): el administrador recibe además el botón 🎯 Apuntar en Bitunix."""
     ok = []
     for uid in uids:
         if uid not in st["users"]:
             continue
         ex = dict(extra or {}, **((per_user or {}).get(uid) or {}))
+        buttons = None
+        if ev["kind"] == "OPEN":
+            buttons = signal_buttons(sym, tf)
+            if uid == "owner" and tid and aim_on(st):
+                buttons = buttons + [[("🎯 Apuntar en Bitunix", "ap:" + tid)]]
         try:
-            send(token, chat_of(uid, owner), message(sym, tf, ev, ex, user_scale(st, uid)),
-                 signal_buttons(sym, tf) if ev["kind"] == "OPEN" else None)
+            send(token, chat_of(uid, owner), message(sym, tf, ev, ex, user_scale(st, uid)), buttons)
             ok.append(uid)
         except Exception as e:
             print("telegram:", uid, e)
@@ -1984,14 +2912,20 @@ def apply(res, st, ctx, token, owner, notify=True):
                      "tradfi": bool(kind), "night": stocks_night(kind), "hm": hm_local(d[ev["bar"]]["ct"])}
             extra.update(open_extras(sym, tf, ev, ctx))
             extra["conf"] = [t for t in ALL_TFS if t != tf and ((ctx.get((sym, t)) or {}).get("T") or {}).get("side") == ev["side"]]
-            to = deliver(token, owner, st, uids, sym, tf, ev, extra, per_user)
+            if "owner" in uids and aim_on(st):  # (en la nube o sin llaves no hay botón: no se guarda nada)
+                aim_store(st, tid, sym, tf, ev, d[ev["bar"]]["ct"])  # para el botón 🎯 Apuntar
+            to = deliver(token, owner, st, uids, sym, tf, ev, extra, per_user, tid=tid)
             if uids and not to:
                 sent.discard(key)  # no llegó a nadie (sin internet): se reintenta en la próxima vuelta
+            if "owner" in to and st.get("auto") and not CLOUD:
+                auto_signal(token, owner, st, sym, tf, ev, tid, late)
             if to:
                 trades[tid] = {"to": to, "t": d[ev["bar"]]["t"], "side": ev["side"]}
                 live[tid] = {"sym": sym, "tf": tf, "side": ev["side"], "e2": ev["e2"], "tp1": ev["tps"][0], "sl": ev["sl"],
                              "filled": not ev.get("limit"), "last": now, "be": tf in BE_TFS}
         else:
+            if ev["kind"] == "CLOSE" and ev.get("reason") == "reverse":
+                bx_flag(tid, "exit")  # operación real en Bitunix: se cierra a mercado (la gestiona el hilo de Bitunix)
             tr = trades.get(tid)
             if not tr or tr.get("cancelled") or (tr.get("closed") and ev["kind"] not in ("CANCEL", "CLOSE")):
                 continue  # nadie recibió esa señal (o ya se avisó que se canceló): no se manda un TP suelto
@@ -2085,6 +3019,19 @@ HOST = (os.environ.get("BOT_NAME") or socket.gethostname() or "PC")[:24]   # nom
 MAIN = os.environ.get("BOT_MAIN") == "1"   # el servidor 24/7 tiene prioridad sobre la PC
 
 
+def my_rank():
+    """v6.3: prioridad para enviar las señales. 2 = tiene llaves de Bitunix (es el que opera) · 1 = servidor 24/7 ★ · 0 = PC."""
+    return 2 if bx_keys() else 1 if MAIN else 0
+
+
+def txt_rank(txt):
+    return 2 if "🔑" in txt else 1 if "★" in txt else 0
+
+
+def marks():
+    return (" ★" if MAIN else "") + (" 🔑" if bx_keys() else "")
+
+
 _hb_lock = threading.Lock()
 _leading = threading.Event()   # este equipo es el que envía las señales (el latido solo corre mientras lo sea)
 
@@ -2099,10 +3046,10 @@ def heartbeat(token, owner, st, force=False, fresh=False):
         with _st_lock:
             st["hb_t"] = now
         try:
-            txt = (f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
+            txt = (f"🟢 Bot activo [{HOST}]{marks()} · {time.strftime('%H:%M')} · {len(active_symbols(st))} monedas · "
                    f"{', '.join(scan_tfs(st))} · {len(st['users'])} usuario(s)")
         except Exception:  # (la lista de usuarios cambió justo ahora en el otro hilo)
-            txt = f"🟢 Bot activo [{HOST}]{' ★' if MAIN else ''} · {time.strftime('%H:%M')}"
+            txt = f"🟢 Bot activo [{HOST}]{marks()} · {time.strftime('%H:%M')}"
         mid = st.get("status_msg")
         if mid and not fresh:
             try:
@@ -2142,8 +3089,8 @@ def hb_loop(token, owner, st):
 
 def am_leader(token, owner, st, force=False):
     """Solo un bot (PC u Oracle) envía señales y contesta comandos. Si otro equipo actualizó el mensaje fijado
-    hace menos de 4 min (según el reloj de Telegram), este espera. El que tiene ★ (servidor 24/7) siempre tiene
-    prioridad: si ve que el fijado es de otro equipo, vuelve a fijar el suyo para que el otro se retire."""
+    hace menos de 4 min (según el reloj de Telegram), este espera. Prioridad: 🔑 (el equipo con llaves de Bitunix,
+    que es el que opera) > ★ (servidor 24/7) > PC. El de más prioridad vuelve a fijar el suyo para que el otro se retire."""
     now = time.time()
     if not force and now - st.get("lead_chk", 0) < 60:
         return st.get("leader", True)
@@ -2158,8 +3105,9 @@ def am_leader(token, owner, st, force=False):
     mine = (pm.get("message_id") and pm.get("message_id") == st.get("status_msg")) or f"[{HOST}]" in txt
     fresh = tg_now() - max(pm.get("date", 0), pm.get("edit_date", 0)) < 240
     other = txt.startswith("🟢") and not mine and fresh
-    leader = not other or (MAIN and "★" not in txt)
-    if leader and MAIN and not mine and not force and now - st.get("repin_t", 0) > 600:  # recuperar el fijado (máx. 1 vez cada 10 min)
+    rank = my_rank()
+    leader = not other or rank > txt_rank(txt)   # v6.3: 🔑 (llaves de Bitunix) > ★ (servidor) > PC
+    if leader and rank and not mine and not force and now - st.get("repin_t", 0) > 600:  # recuperar el fijado (máx. 1 vez cada 10 min)
         st["repin_t"] = now
         print(time.strftime("%H:%M:%S"), "★ el mensaje fijado era de otro equipo: se vuelve a fijar el de este servidor")
         heartbeat(token, owner, st, force=True, fresh=True)
@@ -2295,6 +3243,8 @@ def main():
     except Exception:
         pass
     threading.Thread(target=hb_loop, args=(token, chat, st), daemon=True).start()
+    bx_load()
+    threading.Thread(target=bx_loop, args=(token, chat, st), daemon=True).start()   # operaciones reales en Bitunix
     leader = am_leader(token, chat, st, force=True)
     done = {}  # temporalidad -> última vela revisada (si una revisión dura más de 1 min, no se salta ningún cierre)
     try:
