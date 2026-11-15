@@ -109,18 +109,19 @@ Tus amigos deben aprobarse de nuevo en el bot de Oracle (envían /start otra vez
 
 ## BRIDGE · panel flotante encima de TradingView (Windows)
 
-Doble clic en **`iniciar_panel.bat`** → se abre la ventana **BRIDGE**, siempre encima de TradingView:
+Doble clic en **`iniciar_panel.bat`** → aparece el widget **BRIDGE** (pequeño, ~220 px, siempre encima de TradingView):
 
-- **Moneda automática**: lee la moneda del título de la ventana de TradingView (app de escritorio o navegador).
-  Si escribes otra moneda a mano, deja de seguir TradingView (vuelve a marcar 📺).
-- **Tabla de temporalidades** (1m a 1D) con el mismo motor del bot: dirección de la Tendencial, puntos, señal activa
-  (LONG/SHORT, entrada, SL, TP1) y estado (AHORA · hace N velas · límite · TP1 ✓).
-- **🎯 Apuntar** en cada señal válida (máx. 3 velas, precio aún entre SL y TP1, sin perseguir) → ventana con el plan,
-  tu riesgo abierto antes/después → **Sí** → entra en Bitunix (E1/E2/E3 con SL, TP 40/30/30).
-- **PRUEBA / REAL** (arriba): en PRUEBA solo muestra las órdenes en el registro. REAL pide confirmación y necesita llaves,
-  capital y modo HEDGE.
-- **Posiciones en Bitunix**: PnL no realizado, riesgo hasta el SL, riesgo abierto total vs. tu límite;
-  🖥 panel (las abriste aquí) · 📡 servidor o tuya · ✋ soltada con botón ↩️ Devolver.
+- **Encabezado** ● BRIDGE [PRUEBA/REAL] ⚙ ▾ ×: se mueve arrastrándolo · ▾ lo pliega a una barra · ● verde = llaves OK ·
+  **clic derecho**: tabla completa y registro, actualizar, siempre encima, ajustes, cerrar.
+- **Moneda automática**: la lee del título de la ventana de TradingView. Si escribes otra a mano, deja de seguirla
+  (📺 la vuelve a activar).
+- **Etiquetas 1m…1D**: verde = LONG que se puede apuntar, rojo = SHORT; letra de color = activa pero ya no se puede
+  (más de 3 velas o TP1 tocado). Se elige sola la señal más reciente; clic en otra para cambiarla.
+- **Botón Apuntar** (verde LONG / rojo SHORT): ventana con el plan y tu riesgo abierto antes/después → **Sí** → entra
+  en Bitunix (E1/E2/E3 con SL, TP 40/30/30). No entra si el precio salió de la zona SL–TP1 o ya recorrió media distancia.
+- **PRUEBA / REAL** (clic en la etiqueta): en PRUEBA solo lo anota. REAL pide confirmación y necesita llaves, capital y HEDGE.
+- **Posiciones**: total no realizado, riesgo abierto (rojo si pasa tu límite) y cada posición con L/S y apalancamiento,
+  PnL en $ y %, temporalidad, TP alcanzados, BE y riesgo; "servidor o tuya" = no la abrió el panel; ✋ soltada → ↩️.
 - **Vigilante**: mientras el panel está abierto gestiona lo que abriste desde él (TP, BE, gestión STRIKE, soltar, seguro de
   riesgo, pérdida máxima del día) y te avisa por Telegram con 🖥 BRIDGE. El **SL siempre queda puesto en Bitunix** aunque
   cierres el panel; al abrirlo de nuevo sigue donde quedó. Lo que abre el bot del servidor lo sigue vigilando el servidor.
