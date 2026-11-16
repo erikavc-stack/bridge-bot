@@ -565,6 +565,25 @@ n = len(msgs)
 bot.bx_seguro("t", "1", SG)
 assert len(msgs) == n                                  # no repite el mismo aviso cada minuto
 
+# 25. Bitunix real devuelve la cuenta como OBJETO (la documentación muestra una lista): guard, /posiciones y /bitunix funcionan igual
+fx = nuevo()
+lista = fx.req
+
+
+def cuenta_objeto(method, path, params=None, body=None):
+    r = lista(method, path, params, body)
+    return r[0] if path.endswith("/futures/account") else r
+
+
+bot.bx_req = cuenta_objeto
+assert bot.bx_account()["available"] == "1000.0"
+SG = dict(ST, auto_loss=5)
+bot.bx_guard("t", "1", SG); fx.equity = 900.0; bot.bx_guard("t", "1", SG)
+assert any("bajó más de 5" in m for m in msgs), msgs
+txt, _ = bot.positions_report(ST)
+assert "Sin" in txt or "No tienes" in txt or "capital" in txt, txt
+fx.equity = 1000.0
+
 print("OK: firma, plan, errores aislados, prioridad de equipos, operación real simulada (LONG/SHORT, TP, BE, fallos, cierre, "
       "límites, apply) y v6.4 (🎯 apuntar, soltar/devolver, gestión STRIKE con BE compensado, /posiciones, seguro de riesgo)")
 

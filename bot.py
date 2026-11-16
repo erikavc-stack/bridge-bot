@@ -1174,7 +1174,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/radar cada 30 · /radar off → radar automático\n"
               "/nube → cómo funciona el respaldo en GitHub\n"
               "/auto → órdenes automáticas en Bitunix (prueba · real · capital · riesgo · límites · gestión)\n"
-              "/apuntar si|prueba|no → botón 🎯 en cada señal para abrirla en Bitunix (con confirmación)\n"
+              "/entrar si|prueba|no → botón 🎯 Entrar en cada señal para abrirla en Bitunix (con confirmación)\n"
               "/posiciones → tus posiciones en Bitunix: PnL no realizado, SL y riesgo abierto\n"
               "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
               "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
@@ -1504,12 +1504,12 @@ def command(token, owner, st, ctx, cid, msg):
             reply(text, btn)
         except Exception as e:
             reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}")
-    elif cmd == "/apuntar":
+    elif cmd in ("/entrar", "/apuntar"):
         a = args[0].lower() if args else ""
         if a in ("si", "sí", "on"):
             err = auto_arm_error(st)
             if err:
-                reply("⛔ 🎯 Apuntar sigue en prueba: " + html.escape(err))
+                reply("⛔ 🎯 Entrar sigue en prueba: " + html.escape(err))
                 return
             st["aim_mode"] = "si"
         elif a in ("prueba", "test"):
@@ -1518,9 +1518,9 @@ def command(token, owner, st, ctx, cid, msg):
             st["aim_mode"] = "no"
         mode = {"si": "💸 <b>REAL</b> (al confirmar se envía a Bitunix)", "prueba": "🧪 PRUEBA (muestra las órdenes, no envía nada)",
                 "no": "apagado (sin botón)"}[st.get("aim_mode", "prueba")]
-        reply(f"🎯 <b>Apuntar</b> [{HOST}]: {mode}\nCada señal trae el botón 🎯: lo pulsas, ves el plan con tu capital y riesgo de "
+        reply(f"🎯 <b>Entrar</b> [{HOST}]: {mode}\nCada señal trae el botón 🎯: lo pulsas, ves el plan con tu capital y riesgo de "
               "/auto, y confirmas. Usa los mismos límites (margen máx., apalancamiento, pérdida diaria) y la misma gestión.\n"
-              "/apuntar si · /apuntar prueba · /apuntar no")
+              "/entrar si · /entrar prueba · /entrar no")
     elif cmd == "/seguro":
         a = args[0].lower() if args else ""
         v = parse_num(args)
@@ -1537,7 +1537,7 @@ def command(token, owner, st, ctx, cid, msg):
         try:
             if args and args[0].lower() == "hedge":
                 bx_req("POST", "/api/v1/futures/account/change_position_mode", body={"positionMode": "HEDGE"})
-            acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+            acc = bx_account()
             pm = (bx_req("GET", "/api/v1/futures/account/position_mode") or {}).get("positionMode")
             reply(f"✅ <b>Bitunix conectado</b> [{HOST}]\nDisponible: {acc.get('available')} USDT · margen en uso: {acc.get('margin')}\n"
                   f"Modo de posición: {pm}" + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)"))
@@ -2134,6 +2134,12 @@ def bx_last(sym):
     return float((j.get("data") or [{}])[-1]["close"])
 
 
+def bx_account():
+    """Cuenta de futuros en USDT. Bitunix la devuelve como objeto aunque su documentación muestra una lista: se aceptan las dos."""
+    d = bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or {}
+    return (d[0] if d else {}) if isinstance(d, list) else d
+
+
 def bx_positions(sym):
     return bx_req("GET", "/api/v1/futures/position/get_pending_positions", {"symbol": sym}) or []
 
@@ -2211,7 +2217,7 @@ def auto_signal(token, owner, st, sym, tf, ev, tid, late=False):
 def bx_open(token, owner, st, sym, tf, ev, tid, plan, manual=False):
     """Entradas reales: E1 a mercado (si hay) y E2/E3 límite, cada una con su SL en la misma orden.
     manual=True: la abrió el administrador con el botón 🎯 Apuntar (misma gestión que las automáticas)."""
-    who = "🎯 <b>Apuntar</b>" if manual else "🤖 <b>Auto Bitunix</b>"
+    who = "🎯 <b>Entrar</b>" if manual else "🤖 <b>Auto Bitunix</b>"
     if bx_positions(sym) or bx_orders(sym):
         bx_say(token, owner, f"{who} · {sym} {tf}: no se opera (ya tienes posición u órdenes de {sym} en Bitunix)")
         return
@@ -2525,7 +2531,7 @@ def bx_manage(token, owner, st):
 
 def bx_guard(token, owner, st):
     """Pérdida máxima del día: si el capital de la cuenta cae más de /auto perdida %, no se abren operaciones nuevas hoy."""
-    acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+    acc = bx_account()
     eq = sum(float(acc.get(k) or 0) for k in ("available", "frozen", "margin", "crossUnrealizedPNL", "isolationUnrealizedPNL"))
     day, d = time.strftime("%Y-%m-%d"), _bx["day"]
     if d.get("d") != day:
@@ -2674,11 +2680,11 @@ def aim_press(token, owner, st, tid):
         plan, why = aim_plan(st, a["sym"], a["ev"])
         why = why or aim_check(st, tid, a)
         if why:
-            send(token, owner, f"🎯 {a['sym']} {a['tf']}: no se puede apuntar ({html.escape(why)})")
+            send(token, owner, f"🎯 {a['sym']} {a['tf']}: no se puede entrar ({html.escape(why)})")
             return "No se puede apuntar"
         a["ask"] = time.time()
         head = ("💸 REAL" if mode == "si" else "🧪 PRUEBA (no se enviará nada)") + " · ¿confirmas?"
-        send(token, owner, bx_text(a["sym"], a["tf"], plan, head, "🎯 <b>Apuntar</b>") + aim_risk_line(st, plan) +
+        send(token, owner, bx_text(a["sym"], a["tf"], plan, head, "🎯 <b>Entrar</b>") + aim_risk_line(st, plan) +
              f"\n⏱ Tienes {AIM_CONFIRM} s para confirmar.", [[("✅ Confirmar", "apc:" + tid), ("❌ Cancelar", "apx:" + tid)]])
         return ""
     except Exception as e:
@@ -2700,7 +2706,7 @@ def aim_confirm(token, owner, st, tid):
             send(token, owner, f"🎯 {a['sym']} {a['tf']}: no se envió ({html.escape(why)})")
         elif mode != "si":
             send(token, owner, bx_text(a["sym"], a["tf"], plan, "🧪 PRUEBA (no se envió nada · /apuntar si para operar de verdad)",
-                                       "🎯 <b>Apuntar</b>"))
+                                       "🎯 <b>Entrar</b>"))
         else:
             bx_open(token, owner, st, a["sym"], a["tf"], a["ev"], tid, plan, manual=True)
         return ""
@@ -2741,7 +2747,7 @@ def bx_devolver(tid):
 
 def bx_portfolio():
     """Todas tus posiciones en Bitunix (del bot o no) con el riesgo hasta su SL. Devuelve (filas, capital de la cuenta)."""
-    acc = (bx_req("GET", "/api/v1/futures/account", {"marginCoin": "USDT"}) or [{}])[0]
+    acc = bx_account()
     eq = sum(float(acc.get(k) or 0) for k in ("available", "frozen", "margin", "crossUnrealizedPNL", "isolationUnrealizedPNL"))
     with _bx_lock:
         mine = {r["pid"]: (t, r) for t, r in _bx["trades"].items() if r.get("pid")}
@@ -2826,7 +2832,7 @@ def deliver(token, owner, st, uids, sym, tf, ev, extra=None, per_user=None, tid=
         if ev["kind"] == "OPEN":
             buttons = signal_buttons(sym, tf)
             if uid == "owner" and tid and aim_on(st):
-                buttons = buttons + [[("🎯 Apuntar en Bitunix", "ap:" + tid)]]
+                buttons = buttons + [[("🎯 Entrar en Bitunix", "ap:" + tid)]]
         try:
             send(token, chat_of(uid, owner), message(sym, tf, ev, ex, user_scale(st, uid)), buttons)
             ok.append(uid)

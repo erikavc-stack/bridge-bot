@@ -109,17 +109,19 @@ Tus amigos deben aprobarse de nuevo en el bot de Oracle (envían /start otra vez
 
 ## BRIDGE · panel flotante encima de TradingView (Windows)
 
-Doble clic en **`iniciar_panel.bat`** → aparece el widget **BRIDGE** (pequeño, ~220 px, siempre encima de TradingView):
+Doble clic en el acceso directo **BRIDGE** del escritorio (o en **`iniciar_panel.bat`**) → aparece el panel **BRIDGE**
+(ventana pequeña y moderna de Microsoft Edge en modo aplicación, sin pestañas, siempre encima de TradingView).
+Si ya está abierto, solo lo trae al frente (nunca hay dos). Al cerrar la ventana se cierra el panel.
 
-- **Encabezado** ● BRIDGE [PRUEBA/REAL] ⚙ ▾ ×: se mueve arrastrándolo · ▾ lo pliega a una barra · ● verde = llaves OK ·
-  **clic derecho**: tabla completa y registro, actualizar, siempre encima, ajustes, cerrar.
-- **Moneda automática**: la lee del título de la ventana de TradingView. Si escribes otra a mano, deja de seguirla
-  (📺 la vuelve a activar).
-- **Etiquetas 1m…1D**: verde = LONG que se puede apuntar, rojo = SHORT; letra de color = activa pero ya no se puede
-  (más de 3 velas o TP1 tocado). Se elige sola la señal más reciente; clic en otra para cambiarla.
-- **Botón Apuntar** (verde LONG / rojo SHORT): ventana con el plan y tu riesgo abierto antes/después → **Sí** → entra
-  en Bitunix (E1/E2/E3 con SL, TP 40/30/30). No entra si el precio salió de la zona SL–TP1 o ya recorrió media distancia.
-- **PRUEBA / REAL** (clic en la etiqueta): en PRUEBA solo lo anota. REAL pide confirmación y necesita llaves, capital y HEDGE.
+- **Encabezado** ● BRIDGE [PRUEBA/REAL] ⚙ 📌 ⌃: ● verde = llaves OK · 📌 siempre encima · ⌃ lo pliega a una barra.
+- **Moneda automática**: la lee del título de la ventana de TradingView (etiqueta **TV** en azul). Toca la moneda para
+  escribir otra (deja de seguir TradingView hasta que toques TV).
+- **Temporalidades 1m…1D**: verde = LONG para entrar, rojo = SHORT; letra de color tenue = activa pero ya no se puede
+  (más de 3 velas o TP1 tocado). Se elige sola la señal más reciente; toca otra para cambiarla.
+- **Botón Entrar** (verde LONG / rojo SHORT) = **entrada manual**, cuando TÚ quieres entrar: hoja con E1/E2/E3, SL, TP,
+  margen y tu riesgo abierto antes/después → **Confirmar** (90 s) → entra en Bitunix. No entra si el precio salió de la
+  zona SL–TP1 o ya recorrió media distancia. Las entradas **automáticas** (sin tocar nada) las hace el bot con `/auto si`.
+- **PRUEBA / REAL** (toca la etiqueta): en PRUEBA solo lo anota. REAL pide confirmación y necesita llaves, capital y HEDGE.
 - **Posiciones**: total no realizado, riesgo abierto (rojo si pasa tu límite) y cada posición con L/S y apalancamiento,
   PnL en $ y %, temporalidad, TP alcanzados, BE y riesgo; "servidor o tuya" = no la abrió el panel; ✋ soltada → ↩️.
 - **Vigilante**: mientras el panel está abierto gestiona lo que abriste desde él (TP, BE, gestión STRIKE, soltar, seguro de
@@ -131,14 +133,14 @@ Doble clic en **`iniciar_panel.bat`** → aparece el widget **BRIDGE** (pequeño
 Las llaves del panel se guardan en `panel_llaves.json` (solo en tu PC, está en `.gitignore`) y **no** cambian qué equipo
 manda en el bot de Telegram. Necesita `bot.py` v6.4 o más en la misma carpeta (el panel lo comprueba al abrir).
 
-## v6.4 · Apuntar, posiciones, seguro de riesgo y gestión tipo STRIKE (noviembre 2026)
+## v6.4 · Entrar, posiciones, seguro de riesgo y gestión tipo STRIKE (noviembre 2026)
 
 Funciones inspiradas en STRIKE, hechas sobre el bot (todo desde Telegram, el servidor vigila 24/7):
 
 | Comando / botón | Qué hace | Por defecto |
 |---|---|---|
-| 🎯 **Apuntar en Bitunix** (botón en cada señal, solo administrador) | Lo pulsas → ves el plan con tu capital/riesgo de `/auto` y el riesgo abierto antes y después → **✅ Confirmar** (90 s) → entra en Bitunix con E1/E2/E3, SL y TP, gestionada igual que una automática. No entra si la señal tiene más de 3 velas, si el precio salió de la zona SL–TP1 o si ya recorrió media distancia al TP1. | `/apuntar prueba` |
-| `/apuntar si · prueba · no` | Real (necesita llaves, capital, riesgo y HEDGE) · solo muestra · sin botón | prueba |
+| 🎯 **Entrar en Bitunix** (botón en cada señal, solo administrador) | Entrada manual: lo pulsas → ves el plan con tu capital/riesgo de `/auto` y el riesgo abierto antes y después → **✅ Confirmar** (90 s) → entra en Bitunix con E1/E2/E3, SL y TP, gestionada igual que una automática. No entra si la señal tiene más de 3 velas, si el precio salió de la zona SL–TP1 o si ya recorrió media distancia al TP1. | `/entrar prueba` |
+| `/entrar si · prueba · no` (también `/apuntar`) | Real (necesita llaves, capital, riesgo y HEDGE) · solo muestra · sin botón | prueba |
 | `/posiciones` | Todas tus posiciones en Bitunix: PnL no realizado, SL, riesgo hasta el SL, quién la gestiona (🤖 auto · 🎯 apuntada · ✋ soltada · 👤 tuya) y el **riesgo abierto total** en % de la cuenta | — |
 | `/seguro 5 · si · no` | Aviso si lo que perderías con todos tus SL abiertos pasa ese % de la cuenta, y si una posición tuya no tiene SL | activado, 5 % |
 | `/auto gestion strike` | En vez de "TP1 → BE": al llegar a **`/auto berr` R (1) desde el precio medio REAL** → SL a BE, cancela E2/E3 y cierra **`/auto parcial` % (25)** a mercado. Con **`/auto compensado si`**, cuando el parcial se ejecuta el SL baja (sube en SHORT) lo justo para que, si salta, el resultado total quede ≈ 0 con comisiones; nunca pasa del SL original | `/auto gestion bot` |
