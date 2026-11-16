@@ -193,7 +193,12 @@ difiere más de 3 % del de la señal, o la cantidad queda bajo el mínimo de Bit
 5. `/auto capital …` y `/auto riesgo …`, luego `/auto prueba` unos días para ver qué haría.
 6. `/auto si` con el margen mínimo (`/auto max 10`, `/auto ops 1`) y **mira en Bitunix la primera operación completa**.
 
-**Llaves en Oracle**: necesitas entrar al servidor por SSH, con la llave privada (`.key`) que Oracle te dejó descargar al
+**Llaves en Oracle, lo más fácil (v6.4, sin SSH)**: en Telegram escribe `/llaves` y, en los 3 minutos siguientes, envía en un
+solo mensaje `APIKEY SECRETKEY`. El bot **borra tu mensaje al instante**, prueba las llaves con Bitunix y las guarda solo en el
+equipo que responde (mira el [NOMBRE] en la respuesta: debe ser el servidor). Nunca repite las llaves. Después limita la llave a
+la IP que te muestra (Bitunix → API Management → Vincular dirección IP) para que solo funcione desde el servidor.
+
+**Llaves en Oracle por SSH** (alternativa): necesitas entrar al servidor por SSH, con la llave privada (`.key`) que Oracle te dejó descargar al
 crear la instancia (si no la guardaste, se puede agregar una nueva desde la consola de Oracle). Una vez dentro, copia
 estas dos líneas: te pide las llaves sin mostrarlas en pantalla y reinicia el bot:
 ```

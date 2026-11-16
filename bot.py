@@ -1178,6 +1178,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/posiciones → tus posiciones en Bitunix: PnL no realizado, SL y riesgo abierto\n"
               "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
               "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
+              "/llaves → poner tus llaves de Bitunix en este equipo (tu mensaje se borra al instante)\n"
               "/actualizar → el servidor instala la última versión\n\n"
               "👥 Para compartir: pásale a tu amigo el enlace del bot. Al pulsar INICIAR te llega una solicitud para aprobarla.")
 
@@ -1320,6 +1321,9 @@ def command(token, owner, st, ctx, cid, msg):
         return
     me = st["users"][uid]
     is_owner = uid == "owner"
+    if is_owner and st.get("llaves_t") and text and not text.startswith("/"):
+        llaves_recibir(token, st, cid, msg, reply)  # v6.4: el mensaje con las llaves después de /llaves
+        return
     if not text.startswith("/"):
         return
     if cmd in ("/start", "/ayuda", "/help"):
@@ -1539,10 +1543,25 @@ def command(token, owner, st, ctx, cid, msg):
                 bx_req("POST", "/api/v1/futures/account/change_position_mode", body={"positionMode": "HEDGE"})
             acc = bx_account()
             pm = (bx_req("GET", "/api/v1/futures/account/position_mode") or {}).get("positionMode")
+            ip = mi_ip()
             reply(f"✅ <b>Bitunix conectado</b> [{HOST}]\nDisponible: {acc.get('available')} USDT · margen en uso: {acc.get('margin')}\n"
-                  f"Modo de posición: {pm}" + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)"))
+                  f"Modo de posición: {pm}" + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)")
+                  + (f"\n🌐 IP de este equipo: <code>{ip}</code> (para limitar la llave en Bitunix)" if ip else ""))
         except Exception as e:
-            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}")
+            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}" + ("\n🔑 Ponlas con /llaves" if "faltan las llaves" in str(e) else ""))
+    elif cmd == "/llaves":
+        if args and args[0].lower() in ("cancelar", "no"):
+            st.pop("llaves_t", None)
+            reply("Cancelado: no se guardó nada.")
+        elif CLOUD:
+            reply("⛔ En la nube (GitHub) no se guardan llaves.")
+        else:
+            st["llaves_t"] = time.time()
+            reply(f"🔑 <b>Llaves de Bitunix para [{HOST}]</b>\nEnvíame AHORA, en <b>un solo mensaje</b>, tu <b>API Key</b> y tu <b>Secret Key</b> "
+                  "separadas por un espacio:\n<code>APIKEY SECRETKEY</code>\n\n"
+                  "• Borro tu mensaje al instante, pruebo las llaves con Bitunix y las guardo solo en este equipo.\n"
+                  "• Nunca las repito en ningún mensaje.\n• Usa una llave <b>solo de trading, sin retiros</b>.\n"
+                  f"Tienes {LLAVES_TTL // 60} minutos · /llaves cancelar")
     elif cmd == "/nube":
         reply(f"☁️ <b>Quién envía las señales</b>\nAhora: [{HOST}]{marks()} · v{VERSION}. Solo un bot envía a la vez (el mensaje fijado 🟢 "
               "dice cuál). Prioridad: el equipo con llaves de Bitunix (🔑, el que opera) > el servidor 24/7 (★) > la PC; "
@@ -2132,6 +2151,80 @@ def bx_last(sym):
     """Último precio en Bitunix (sin tocar _bitunix_syms, que decide el enlace del gráfico)."""
     j = http_get(f"{BITUNIX}?{urllib.parse.urlencode({'symbol': sym, 'interval': '1m', 'limit': 1})}", timeout=20)
     return float((j.get("data") or [{}])[-1]["close"])
+
+
+LLAVES_TTL = 180                                   # segundos para mandar las llaves después de /llaves
+KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
+
+
+def mi_ip():
+    """IP pública de este equipo (para limitar la llave de Bitunix a este servidor)."""
+    for url in ("https://api.ipify.org?format=json", "https://api64.ipify.org?format=json"):
+        try:
+            return http_get(url, timeout=10).get("ip")
+        except Exception:
+            pass
+    return None
+
+
+def llaves_recibir(token, st, cid, msg, reply):
+    """v6.4 · /llaves: el mensaje con las llaves se BORRA al instante, se prueban con Bitunix y se guardan solo en config.json de
+    este equipo (si Bitunix las rechaza, se deja todo como estaba). Las llaves nunca se repiten en ningún mensaje ni registro."""
+    t0 = st.pop("llaves_t", 0)
+    try:
+        tg(token, "deleteMessage", {"chat_id": cid, "message_id": msg.get("message_id")})
+        aviso = ""
+    except Exception:
+        aviso = "\n⚠️ No pude borrar tu mensaje: bórralo tú (mantén presionado → Eliminar)."
+    if time.time() - t0 > LLAVES_TTL:
+        reply(f"⌛ Pasaron más de {LLAVES_TTL // 60} minutos desde /llaves: no se guardó nada. Escribe /llaves otra vez." + aviso)
+        return
+    parts = (msg.get("text") or "").split()
+    if len(parts) != 2 or not all(KEY_RE.fullmatch(p) for p in parts):
+        reply("⚠️ Eso no parece una API Key y una Secret Key (2 textos separados por un espacio). No se guardó nada. "
+              "Escribe /llaves otra vez." + aviso)
+        return
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    antes = (cfg.get("bitunix_key"), cfg.get("bitunix_secret"))
+
+    def guardar(k, s):
+        c = dict(cfg)
+        if k and s:
+            c["bitunix_key"], c["bitunix_secret"] = k, s
+        else:
+            c.pop("bitunix_key", None)
+            c.pop("bitunix_secret", None)
+        tmp = CONFIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(c, f)
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        os.replace(tmp, CONFIG_FILE)
+
+    guardar(*parts)
+    try:
+        acc = bx_account()
+        pm = (bx_req("GET", "/api/v1/futures/account/position_mode") or {}).get("positionMode")
+    except Exception as e:
+        guardar(*antes)  # rechazadas: queda lo que había
+        err = str(e)
+        for p in parts:
+            err = err.replace(p, "•••")
+        reply(f"⛔ Bitunix rechazó esas llaves ({html.escape(err)[:160]}). No se guardaron. Revisa que las copiaste completas "
+              "y escribe /llaves otra vez." + aviso)
+        return
+    ip = mi_ip()
+    reply(f"✅ <b>Llaves guardadas y probadas</b> en [{HOST}]\nBitunix conectado · disponible {acc.get('available')} USDT · modo {pm}"
+          + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)")
+          + (f"\n\n🔒 Más seguridad: en Bitunix → API Management → edita la llave → <b>Vincular dirección IP</b> → <code>{ip}</code> "
+             "(así esa llave solo funciona desde este servidor)." if ip else "")
+          + "\n\nSiguiente: /auto (capital, riesgo y prueba)" + aviso)
 
 
 def bx_account():

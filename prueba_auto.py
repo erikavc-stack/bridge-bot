@@ -584,6 +584,44 @@ txt, _ = bot.positions_report(ST)
 assert "Sin" in txt or "No tienes" in txt or "capital" in txt, txt
 fx.equity = 1000.0
 
+# 26. /llaves: borra el mensaje, prueba y guarda; si Bitunix las rechaza no cambia nada; nunca repite las llaves
+fx = nuevo()
+cfgf = os.path.join(tempfile.mkdtemp(), "config.json")
+json.dump({"token": "t", "chat_id": "1"}, open(cfgf, "w"))
+bot.CONFIG_FILE = cfgf
+
+
+def llaves_de_archivo():
+    c = json.load(open(cfgf, encoding="utf-8"))
+    return (c["bitunix_key"], c["bitunix_secret"]) if c.get("bitunix_key") else None
+
+
+BUENA, SECRETA = "A1b2" * 8, "Zz9_" * 8
+bot.bx_keys = llaves_de_archivo
+bot.bx_req = lambda method, path, params=None, body=None: (
+    fx.req(method, path, params, body) if (llaves_de_archivo() or ("",))[0] == BUENA
+    else (_ for _ in ()).throw(RuntimeError("Bitunix 10007: Sign signature error")))
+bot.mi_ip = lambda: "203.0.113.7"
+borrados = []
+bot.tg = lambda token, method, params=None, timeout=20: borrados.append(params["message_id"]) if method == "deleteMessage" else {}
+STL = {"users": {"owner": {}}, "pending": {}, "capital": 100, "risk": 1}
+cmd = lambda text, mid=1: bot.command("t", "1", STL, {}, "1", {"text": text, "message_id": mid})
+cmd("/llaves")
+assert "un solo mensaje" in msgs[-1] and STL.get("llaves_t")
+cmd(f"{BUENA} {SECRETA}", mid=77)
+assert borrados == [77] and llaves_de_archivo() == (BUENA, SECRETA), (borrados, llaves_de_archivo())
+assert "Llaves guardadas y probadas" in msgs[-1] and "203.0.113.7" in msgs[-1]
+assert not any(BUENA in m or SECRETA in m for m in msgs), "las llaves nunca se repiten"
+cmd("/llaves"); cmd("hola", mid=78)                                     # formato malo: no toca nada
+assert "no parece" in msgs[-1] and llaves_de_archivo() == (BUENA, SECRETA) and 78 in borrados
+cmd("/llaves"); cmd("Q" * 32 + " " + "W" * 32, mid=79)                  # rechazadas por Bitunix: quedan las anteriores
+assert "rechazó" in msgs[-1] and llaves_de_archivo() == (BUENA, SECRETA)
+assert not any("Q" * 32 in m or "W" * 32 in m for m in msgs)
+cmd("/llaves"); STL["llaves_t"] -= 600; cmd(f"{BUENA} {SECRETA}", mid=80)  # tarde
+assert "Pasaron más de" in msgs[-1] and 80 in borrados
+cmd("hola sin /llaves", mid=81)                                         # sin /llaves antes: se ignora
+assert 81 not in borrados
+
 print("OK: firma, plan, errores aislados, prioridad de equipos, operación real simulada (LONG/SHORT, TP, BE, fallos, cierre, "
       "límites, apply) y v6.4 (🎯 apuntar, soltar/devolver, gestión STRIKE con BE compensado, /posiciones, seguro de riesgo)")
 
