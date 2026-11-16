@@ -1179,6 +1179,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
               "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
               "/llaves → poner tus llaves de Bitunix en este equipo (tu mensaje se borra al instante)\n"
+              "/noticias 15 · /noticias no → pausa del automático alrededor de noticias de alto impacto (CPI, Fed, empleo…)\n"
               "/actualizar → el servidor instala la última versión\n\n"
               "👥 Para compartir: pásale a tu amigo el enlace del bot. Al pulsar INICIAR te llega una solicitud para aprobarla.")
 
@@ -1551,6 +1552,29 @@ def command(token, owner, st, ctx, cid, msg):
             ip = mi_ip()
             reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}" + ("\n🔑 Ponlas con /llaves" if "faltan las llaves" in str(e) else "")
                   + (f"\n🌐 IP de este equipo: <code>{ip}</code> (agrégala a tu llave en Bitunix si la limitaste por IP)" if ip else ""))
+    elif cmd == "/noticias":
+        a = args[0].lower() if args else ""
+        v = parse_num(args)
+        if a in ("no", "off"):
+            st["noticias"] = 0
+        elif a in ("si", "sí", "on"):
+            st["noticias"] = st.get("noticias") or NEWS_DEF_MIN
+        elif v is not None and 0 <= v <= 240:
+            st["noticias"] = v
+        mins = st.get("noticias", NEWS_DEF_MIN)
+        try:
+            ev = news_events(force=bool(a))
+        except Exception:
+            ev = []
+        now = int(time.time() * 1000)
+        nxt = [x for x in ev if x[0] + mins * 60_000 >= now][:12]
+        lines = [f"• {dia_hora(t)} · {html.escape(title)} ({cc})" for t, title, cc in nxt]
+        reply(f"📰 <b>Filtro de noticias</b> [{HOST}]: " + (f"pausa de las entradas automáticas <b>±{mins:g} min</b> alrededor de "
+              "cada noticia de alto impacto" if mins else "<b>apagado</b>") +
+              (f"\n⏸ Ahora mismo: {html.escape(news_block(st))}" if news_block(st) else "") +
+              ("\n\n<b>Próximas (hora UTC" + f"{TZ_H:+g}" + "):</b>\n" + "\n".join(lines) if lines else "\n\nNo hay más noticias de alto impacto esta semana.") +
+              "\n\nLas operaciones abiertas siguen con su SL y TP. Las entradas manuales (🎯) no se bloquean: solo avisan.\n"
+              "/noticias 15 · /noticias 30 · /noticias no")
     elif cmd == "/llaves":
         if args and args[0].lower() in ("cancelar", "no"):
             st.pop("llaves_t", None)
@@ -2155,6 +2179,69 @@ def bx_last(sym):
     return float((j.get("data") or [{}])[-1]["close"])
 
 
+# ----------------------------- v6.4 · FILTRO DE NOTICIAS (calendario económico) -----------------------------
+# Alrededor de las noticias de ALTO impacto (CPI, FOMC, empleo, ventas minoristas, discursos de la Fed…) el precio da saltos y
+# el SL puede ejecutarse peor: el modo automático no abre operaciones nuevas N minutos antes y después (/noticias).
+# Las abiertas siguen con su SL y TP. No está en el backtest: es protección contra volatilidad, no una mejora probada.
+NEWS_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"   # calendario semanal público (ForexFactory)
+NEWS_EVERY = 4 * 3600                                                 # se descarga cada 4 h (el archivo cambia poco)
+NEWS_DEF_MIN = 15                                                     # pausa por defecto: 15 min antes y después
+_news = {"t": 0.0, "ev": []}                                          # [(ms, título, país)] de alto impacto
+DIAS = ("lun", "mar", "mié", "jue", "vie", "sáb", "dom")
+
+
+def news_events(force=False):
+    """Noticias de alto impacto de esta semana (por defecto de EE. UU.: NEWS_CC=USD,EUR para sumar otras)."""
+    if force or time.time() - _news["t"] > NEWS_EVERY:
+        import datetime
+        try:
+            cc = tuple(x for x in os.environ.get("NEWS_CC", "USD").split(",") if x)
+            ev = []
+            for r in http_get(NEWS_URL, timeout=20) or []:
+                if r.get("impact") == "High" and r.get("country") in cc and r.get("date"):
+                    t = int(datetime.datetime.fromisoformat(r["date"]).timestamp() * 1000)
+                    ev.append((t, str(r.get("title") or "noticia")[:60], r["country"]))
+            _news.update(t=time.time(), ev=sorted(ev))
+        except Exception as e:
+            _news["t"] = time.time() - NEWS_EVERY + 600  # sin calendario: se reintenta en 10 min (mientras, sin pausa)
+            print("noticias:", e)
+    return _news["ev"]
+
+
+def dia_hora(ms):
+    g = time.gmtime(ms / 1000 + TZ_H * 3600)
+    return f"{DIAS[g.tm_wday]} {g.tm_mday} · {g.tm_hour:02d}:{g.tm_min:02d}"
+
+
+def news_block(st, now_ms=None):
+    """Motivo para NO abrir ahora por una noticia ('' = se puede)."""
+    mins = st.get("noticias", NEWS_DEF_MIN)
+    if not mins:
+        return ""
+    now = now_ms or int(time.time() * 1000)
+    for t, title, cc in news_events():
+        if t - mins * 60_000 <= now <= t + mins * 60_000:
+            return f"📰 noticia de alto impacto: {title} ({cc}) a las {hm_local(t)} · pausa ±{mins:g} min"
+    return ""
+
+
+def news_tick(token, owner, st):
+    """Aviso por Telegram cuando empieza la pausa de una noticia (una vez por noticia; solo con /auto prueba o si)."""
+    mins = st.get("noticias", NEWS_DEF_MIN)
+    if not mins or st.get("auto") not in ("si", "prueba"):
+        return
+    now, sent = int(time.time() * 1000), st.setdefault("news_sent", [])
+    due = [(t, title, cc) for t, title, cc in news_events() if t - mins * 60_000 <= now < t and f"{t}" not in sent]
+    if due:
+        t = due[0][0]
+        same = [f"<b>{html.escape(x[1])}</b> ({x[2]})" for x in due if x[0] == t]
+        sent.append(f"{t}")
+        st["news_sent"] = sent[-60:]
+        bx_say(token, owner, f"📰 <b>Noticia de alto impacto</b> en {max(1, (t - now) // 60_000)} min: " + " · ".join(same) +
+               f" a las {hm_local(t)}.\n⏸ Pauso las entradas automáticas de {hm_local(t - mins * 60_000)} a "
+               f"{hm_local(t + mins * 60_000)}. Las operaciones abiertas siguen con su SL y TP.")
+
+
 LLAVES_TTL = 180                                   # segundos para mandar las llaves después de /llaves
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
 
@@ -2301,6 +2388,7 @@ def auto_signal(token, owner, st, sym, tf, ev, tid, late=False):
                 why = f"ya hay una operación automática en {sym}"
             elif late:
                 why = "la señal llegó con retraso: no se entra tarde a mercado"
+        why = why or news_block(st)  # v6.4: pausa alrededor de noticias de alto impacto (también en prueba, para que se vea)
         plan, why2 = aim_plan(st, sym, ev)
         why = why or why2
         if plan and not why:
@@ -2648,12 +2736,15 @@ def bx_guard(token, owner, st):
 
 
 def bx_loop(token, owner, st):
-    t_guard = t_seg = 0.0
+    t_guard = t_seg = t_news = 0.0
     while True:
         time.sleep(10)
         if not (_leading.is_set() and bx_keys()):
             continue
         try:
+            if time.time() - t_news > 30:  # v6.4: aviso de noticias de alto impacto
+                t_news = time.time()
+                news_tick(token, owner, st)
             if _bx["trades"]:
                 bx_manage(token, owner, st)
             if (st.get("auto") == "si" or st.get("aim_mode") == "si") and time.time() - t_guard > 300:
@@ -2693,6 +2784,7 @@ def auto_status(st):
             f"🔢 Máx. operaciones: {st.get('auto_ops', 1)} · margen máx: ${st.get('auto_max', AUTO_CAP):g} · "
             f"apalancamiento máx: {st.get('auto_lev', 0) or 'el de la señal'}\n"
             f"🛑 Pérdida máxima diaria: {st.get('auto_loss', 5):g} % · 🛟 BE tras TP1: {', '.join(be) if be else 'no'}\n"
+            f"📰 Noticias: " + (f"pausa ±{st.get('noticias', NEWS_DEF_MIN):g} min (/noticias)\n" if st.get("noticias", NEWS_DEF_MIN) else "sin pausa (/noticias)\n")
             + (f"🎯 Gestión STRIKE: BE a {st.get('auto_berr', 1.0):g} R del precio medio real · parcial "
                f"{st.get('auto_parcial', 25.0):g} % · BE compensado {'sí' if st.get('auto_comp', True) else 'no'} "
                "(sin TP1→BE; no está en el backtest)\n" if st.get("auto_mg") == "strike" else "🎯 Gestión: la del bot (TP1 → BE)\n")
@@ -2769,6 +2861,8 @@ def aim_risk_line(st, plan):
     now_r = sum(x["risk"] or 0 for x in rows)
     a, b = (now_r / eq * 100, (now_r + plan_risk(plan)) / eq * 100) if eq else (0, 0)
     warn = f"\n⚠️ <b>Pasarías tu límite de riesgo ({lim:g} %)</b>" if st.get("seguro", True) and b > lim else ""
+    nw = news_block(st)  # entrada manual: no se bloquea, pero se avisa
+    warn += f"\n⚠️ <b>Ojo</b>: {html.escape(nw)} (el automático está en pausa)" if nw else ""
     return f"\n🛡 Riesgo abierto: {a:.1f} % → {b:.1f} % de la cuenta (esta operación: ${plan_risk(plan):.2f}){warn}"
 
 

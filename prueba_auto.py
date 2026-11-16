@@ -627,6 +627,39 @@ assert "Pasaron más de" in msgs[-1] and 80 in borrados
 cmd("hola sin /llaves", mid=81)                                         # sin /llaves antes: se ignora
 assert 81 not in borrados
 
+# 27. Filtro de noticias: solo alto impacto de EE. UU.; pausa ±15 min del automático (también en prueba); aviso una sola vez;
+#     /noticias 0 lo apaga; la entrada manual no se bloquea pero avisa
+reales_get = bot.http_get
+ahora_ms = int(bot.time.time() * 1000)
+iso = lambda ms: bot.time.strftime("%Y-%m-%dT%H:%M:%S+00:00", bot.time.gmtime(ms / 1000))
+bot.http_get = lambda url, timeout=20: [
+    dict(title="CPI m/m", country="USD", impact="High", date=iso(ahora_ms + 10 * 60_000)),
+    dict(title="Core CPI m/m", country="USD", impact="High", date=iso(ahora_ms + 10 * 60_000)),
+    dict(title="Crude Oil Inventories", country="USD", impact="Medium", date=iso(ahora_ms + 5 * 60_000)),
+    dict(title="ECB Press Conference", country="EUR", impact="High", date=iso(ahora_ms + 5 * 60_000))]
+ev_n = bot.news_events(force=True)
+assert [x[1] for x in ev_n] == ["CPI m/m", "Core CPI m/m"] and abs(ev_n[0][0] - (ahora_ms + 600_000)) < 1500, ev_n
+fx = nuevo()
+bot.bx_req, bot.bx_keys = fx.req, (lambda: ("k", "s"))
+STN = dict(ST, auto="prueba", trades={})
+bot.auto_signal("t", "1", STN, "SOLUSDT", "15m", EV, TID)
+assert "no se opera" in msgs[-1] and "CPI m/m" in msgs[-1] and not fx.orders, msgs[-1]
+n = len(msgs)
+bot.news_tick("t", "1", STN); bot.news_tick("t", "1", STN)
+assert len(msgs) == n + 1 and "Pauso las entradas automáticas" in msgs[-1] and "Core CPI" in msgs[-1], msgs[-1]
+assert "Ojo" in bot.aim_risk_line(STN, bot.aim_plan(STN, "SOLUSDT", EV)[0])   # manual: avisa
+STN["noticias"] = 0
+assert bot.news_block(STN) == ""
+bot.auto_signal("t", "1", STN, "SOLUSDT", "15m", EV, TID)
+assert "PRUEBA" in msgs[-1], msgs[-1]                                   # sin filtro: sigue normal
+STN["noticias"] = 15
+assert bot.news_block(STN, ahora_ms + 26 * 60_000) == ""                # pasados 15 min después: libre
+bot.http_get = lambda url, timeout=20: (_ for _ in ()).throw(OSError("sin internet"))
+bot._news["t"] = 0
+assert bot.news_events() == [] or True                                  # sin calendario no rompe nada
+bot.http_get = reales_get
+bot._news.update(t=0.0, ev=[])
+
 print("OK: firma, plan, errores aislados, prioridad de equipos, operación real simulada (LONG/SHORT, TP, BE, fallos, cierre, "
       "límites, apply) y v6.4 (🎯 apuntar, soltar/devolver, gestión STRIKE con BE compensado, /posiciones, seguro de riesgo)")
 

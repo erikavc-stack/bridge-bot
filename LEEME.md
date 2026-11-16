@@ -149,6 +149,13 @@ Funciones inspiradas en STRIKE, hechas sobre el bot (todo desde Telegram, el ser
 (no mueve SL, no pone TP, no la cierra por señal contraria) y te avisa con el botón **↩️ Devolver al bot**, que la vuelve a
 gestionar adoptando tu SL y la cantidad actual. Si se cierra estando soltada, igual te llega el resultado y se cancelan sus E2/E3.
 
+**📰 Filtro de noticias** (`/noticias`): el bot lee el calendario económico semanal (ForexFactory) y, **15 minutos antes y
+15 después** de cada noticia de **alto impacto de EE. UU.** (CPI, decisiones y minutas de la Fed, empleo, ventas minoristas,
+discursos del presidente de la Fed…), **no abre operaciones automáticas nuevas** (en `/auto prueba` también se ve). Te avisa
+por Telegram cuando empieza la pausa. Las abiertas siguen con su SL y TP; las entradas manuales (🎯 Entrar) no se bloquean, solo
+avisan. `/noticias` muestra las próximas · `/noticias 30` cambia la pausa · `/noticias no` lo apaga. Otros países:
+variable `NEWS_CC=USD,EUR`. No está en el backtest (no hay historial de noticias): es protección contra saltos de precio.
+
 ⚠️ La gestión STRIKE (BE a 1 R + parcial + compensado) **no está en el backtest**: el simulador y el winrate siguen usando la
 gestión del bot. Pruébala con `/auto prueba` o margen mínimo antes de usarla en serio. Las operaciones apuntadas cuentan para
 `/auto ops`. Pruebas sin red: `python prueba_auto.py`.
