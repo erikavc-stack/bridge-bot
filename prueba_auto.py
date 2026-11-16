@@ -660,6 +660,88 @@ assert bot.news_events() == [] or True                                  # sin ca
 bot.http_get = reales_get
 bot._news.update(t=0.0, ev=[])
 
+# 28. Precisión real (/real): acierto y neto con comisiones, por temporalidad, señal vs real, aviso de pocas operaciones;
+#     resumen semanal una sola vez (domingo 20:00 hora local) y se puede apagar
+fx = nuevo()
+STR = dict(ST, auto="si", trades={}, journal=[dict(id="A_15m_1", r=1.2), dict(id="B_2h_1", r=-1.0)])
+assert "Todavía no hay operaciones reales" in bot.real_report(STR, 7)
+t_now = int(bot.time.time() * 1000)
+bot._bx["journal"] = [
+    dict(tid="A_15m_1", sym="SOLUSDT", tf="15m", t=t_now - 3600_000, pnl="2.10", fee="0.10", funding="0", tp=3, s=1, risk=2.0, manual=False),
+    dict(tid="B_2h_1", sym="ETHUSDT", tf="2h", t=t_now - 7200_000, pnl="-0.90", fee="-0.10", funding="0", tp=0, s=-1, risk=1.0, manual=True),
+    dict(tid="C_15m_1", sym="SOLUSDT", tf="15m", t=t_now - 20 * 86_400_000, pnl="5", fee="0", tp=1)]   # vieja y sin riesgo (v6.3)
+rp = bot.real_report(STR, 7)
+assert "Operaciones: <b>2</b> · ✅ 1 · ❌ 1 · acierto <b>50%</b>" in rp, rp
+assert "<b>+1.00 USDT</b>" in rp and "comisiones −0.20" in rp and "Factor: <b>2.00</b>" in rp, rp
+assert "<b>+0.00 R</b>" in rp and "15m: +2.00 · 1 · 100% · ∞ / 1.5" in rp and "2h: −1.00 · 1 · 0%" in rp, rp
+assert "la señal marcó +0.20 R · en Bitunix salió +0.00 R" in rp and "Automáticas: 1" in rp and "pocas operaciones (2)" in rp, rp
+assert "Operaciones: <b>3</b>" in bot.real_report(STR, 0)
+real_gm = bot.time.gmtime
+n = len(msgs)
+bot.time.gmtime = lambda t=None: real_gm(1_763_251_200 + 19 * 3600)    # domingo 19:00: todavía no
+bot.real_weekly("t", "1", STR)
+assert len(msgs) == n
+bot.time.gmtime = lambda t=None: real_gm(1_763_251_200 + 21 * 3600)    # domingo 21:00
+bot.real_weekly("t", "1", STR); bot.real_weekly("t", "1", STR)
+assert len(msgs) == n + 1 and "Resumen de la semana" in msgs[-1] and "acierto" in msgs[-1], msgs[-1]
+STR.update(semanal=False, semanal_sent="")
+bot.real_weekly("t", "1", STR)
+assert len(msgs) == n + 1
+bot.time.gmtime = real_gm
+bot._bx["journal"] = []
+
+# 29. Giro 4h (v6.5, SOLO PRUEBA): entra al giro de la Tendencial, SL = Tendencial, avisa una vez por vela, guarda el
+#     resultado en R, nunca envía órdenes y /giro si se niega
+fx = nuevo()
+H4 = bot.TF_MS["4h"]
+t_fin = int(bot.time.time() * 1000) // H4 * H4 - H4          # última vela de 4h ya cerrada
+def velas_giro(n_extra):
+    px, out = 100.0, []
+    for k in range(120 + n_extra):
+        paso = -0.4 if k < 100 else (3.0 if k < 112 else -4.0)   # baja suave, sube fuerte (giro a LONG), cae (giro a SHORT)
+        o, px = px, px + paso
+        t = t_fin - (120 + n_extra - 1 - k) * H4
+        out.append(dict(t=t, o=o, h=max(o, px) + 0.2, l=min(o, px) - 0.2, c=px, v=1.0, ct=t + H4 - 1))
+    return out
+STG = dict(ST, symbols=["SOLUSDT"], top=0, trades={})
+bot.active_symbols = lambda st: ["SOLUSDT"]
+real_fk = bot.fetch_klines
+serie = velas_giro(0)
+bot.fetch_klines = lambda sym, tf, limit=600: serie[:corte]
+cmd_g = lambda text: bot.command("t", "1", STG, {}, "1", {"text": text, "message_id": 1})
+cmd_g("/giro si")
+assert "todavía no opera con dinero real" in msgs[-1] and bot.giro_state(STG)["on"] == "", msgs[-1]
+cmd_g("/giro prueba")
+assert "PRUEBA activa" in msgs[-1] and "no envía órdenes" in msgs[-1], msgs[-1]
+g = bot.giro_state(STG)
+corte = 95
+bot.giro_tick("t", "1", STG)                                  # primera vez: solo toma la referencia
+assert not g["pos"] and not g["hist"] and g["last"]["SOLUSDT"] == serie[94]["t"]
+vistos = []
+for corte in range(96, len(serie) + 1):
+    g["bucket"] = 0
+    n = len(msgs)
+    t_falso = (serie[corte - 1]["ct"] + 30_000) / 1000        # 30 s después del cierre de esa vela
+    real_time = bot.time.time
+    bot.time.time = lambda: t_falso
+    try:
+        bot.giro_tick("t", "1", STG)
+        bot.giro_tick("t", "1", STG)                          # la misma vela no avisa dos veces
+    finally:
+        bot.time.time = real_time
+    assert len(msgs) - n <= 1
+    vistos += msgs[n:]
+abre = [m for m in vistos if "<b>SOL LONG</b>" in m]
+cierra = [m for m in vistos if "cerrada" in m]
+assert len(abre) == 1 and "SL" in abre[0] and "PRUEBA" in abre[0], vistos
+assert cierra and g["hist"] and g["hist"][0]["s"] == 1 and g["hist"][0]["r"] > 0, (vistos, g["hist"])
+assert not fx.orders and not bot._bx["trades"]                # ninguna orden a Bitunix
+cmd_g("/giro")
+assert "cerradas" in msgs[-1] and "36 %" in msgs[-1], msgs[-1]
+cmd_g("/giro no")
+assert bot.giro_state(STG)["on"] == "" and "apagado" in msgs[-1]
+bot.fetch_klines = real_fk
+
 print("OK: firma, plan, errores aislados, prioridad de equipos, operación real simulada (LONG/SHORT, TP, BE, fallos, cierre, "
       "límites, apply) y v6.4 (🎯 apuntar, soltar/devolver, gestión STRIKE con BE compensado, /posiciones, seguro de riesgo)")
 

@@ -156,6 +156,22 @@ por Telegram cuando empieza la pausa. Las abiertas siguen con su SL y TP; las en
 avisan. `/noticias` muestra las próximas · `/noticias 30` cambia la pausa · `/noticias no` lo apaga. Otros países:
 variable `NEWS_CC=USD,EUR`. No está en el backtest (no hay historial de noticias): es protección contra saltos de precio.
 
+**🧭 Giro 4h · estrategia nueva, SOLO PRUEBA** (`/giro`, v6.5): en el laboratorio (`treding/`, 24 monedas, junio 2024 →
+noviembre 2026, comisiones incluidas) el Bridge Táctico no mostró ventaja estable (factor 0.84–0.96 en 2h/4h/8h; 15m pierde).
+De 13 estrategias nuevas, la única que ganó en todas las partes fue **seguir el giro de la Tendencial de 4h**: se entra cuando
+gira, el SL es la propia Tendencial (sigue al precio) y se sale cuando el precio la toca o gira al otro lado. Enero 2023 →
+noviembre 2026: factor 1.32, acierto 36 %, +285 R, peor racha −85 R; **perdió todo 2025** (0.74). No incluye funding.
+`/giro prueba` la simula con tus monedas y avisa cada entrada y salida por Telegram (**no envía ninguna orden**) ·
+`/giro` muestra abiertas y resultado en R · `/giro no` la apaga. `/giro si` se niega: el dinero real se decide después de la
+prueba.
+
+**📊 Precisión real** (`/real`): `/stats` mide las señales (simulación); `/real` mide el **dinero**: cada posición que el bot
+abrió en Bitunix y ya se cerró, con el PnL que informa Bitunix menos comisiones. Muestra acierto, neto en USDT, factor, resultado
+en R, desglose por temporalidad (factor real junto al del backtest) y por moneda, hasta qué TP llegaron, automáticas vs manuales
+y **señal vs real** (lo que marcó la señal contra lo que salió en Bitunix). `/real` = últimos 7 días · `/real 30` · `/real todo`.
+Cada **domingo a las 20:00** (hora `TZ_HOURS`) llega solo el resumen de la semana; `/real semanal no` lo apaga. Con menos de
+30 operaciones avisa que el acierto todavía no es fiable.
+
 ⚠️ La gestión STRIKE (BE a 1 R + parcial + compensado) **no está en el backtest**: el simulador y el winrate siguen usando la
 gestión del bot. Pruébala con `/auto prueba` o margen mínimo antes de usarla en serio. Las operaciones apuntadas cuentan para
 `/auto ops`. Pruebas sin red: `python prueba_auto.py`.

@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math, hashlib, uuid
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.4"
+VERSION = "6.5"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -1179,6 +1179,8 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
               "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
               "/llaves → poner tus llaves de Bitunix en este equipo (tu mensaje se borra al instante)\n"
+              "/giro prueba · /giro no → estrategia nueva Giro 4h en modo PRUEBA (simulación, sin dinero) · /giro = resultado\n"
+              "/real → precisión con dinero REAL en Bitunix: acierto, neto, por temporalidad y moneda (resumen cada domingo)\n"
               "/noticias 15 · /noticias no → pausa del automático alrededor de noticias de alto impacto (CPI, Fed, empleo…)\n"
               "/actualizar → el servidor instala la última versión\n\n"
               "👥 Para compartir: pásale a tu amigo el enlace del bot. Al pulsar INICIAR te llega una solicitud para aprobarla.")
@@ -1552,6 +1554,30 @@ def command(token, owner, st, ctx, cid, msg):
             ip = mi_ip()
             reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}" + ("\n🔑 Ponlas con /llaves" if "faltan las llaves" in str(e) else "")
                   + (f"\n🌐 IP de este equipo: <code>{ip}</code> (agrégala a tu llave en Bitunix si la limitaste por IP)" if ip else ""))
+    elif cmd == "/giro":
+        a = args[0].lower() if args else ""
+        g = giro_state(st)
+        if a in ("prueba", "test"):
+            g["on"], g["bucket"] = "prueba", 0
+        elif a in ("no", "off"):
+            g["on"] = ""
+        elif a in ("si", "sí", "real", "on"):
+            reply("⛔ Giro 4h todavía no opera con dinero real: primero la prueba. Cuando haya suficientes operaciones "
+                  "simuladas se decide si se conecta a Bitunix.\n/giro prueba")
+            return
+        reply(giro_report(st))
+    elif cmd in ("/real", "/precision"):
+        a = args[0].lower() if args else ""
+        if a in ("semanal", "semana"):
+            b = args[1].lower() if len(args) > 1 else ""
+            if b in ("no", "off", "si", "sí", "on"):
+                st["semanal"] = b in ("si", "sí", "on")
+            reply("🗓 Resumen semanal de precisión real: " + ("<b>activado</b> (domingos 20:00, hora UTC" + f"{TZ_H:+g}" + ")"
+                  if st.get("semanal", True) else "<b>apagado</b>") + "\n/real semanal si · /real semanal no")
+        else:
+            v = parse_num(args) if args and a not in ("todo", "all", "total") else None
+            days = 0 if a in ("todo", "all", "total") else int(min(max(v, 1), 3650)) if v else 7
+            reply(real_report(st, days))
     elif cmd == "/noticias":
         a = args[0].lower() if args else ""
         v = parse_num(args)
@@ -2242,6 +2268,245 @@ def news_tick(token, owner, st):
                f"{hm_local(t + mins * 60_000)}. Las operaciones abiertas siguen con su SL y TP.")
 
 
+# ----------------------------- GIRO 4h (estrategia nueva · SOLO PRUEBA, sin dinero) -----------------------------
+# v6.5. En el laboratorio (treding/estrategias_lab.py, 24 monedas, ene-2023 → nov-2026, costes incluidos) fue la única de 13
+# estrategias que ganó en todas las partes: factor 1.32, acierto 36 %, +285 R; perdió todo 2025 (0.74) y su peor racha fue −85 R.
+# Regla: se entra cuando la Tendencial de 4h GIRA, el SL es la propia Tendencial (sigue al precio, nunca se aleja) y se sale
+# cuando el precio la toca o gira al otro lado. Aquí solo se SIMULA y se avisa por Telegram: no envía ninguna orden a Bitunix.
+GIRO_TF = "4h"
+GIRO_FEE = 0.0008        # por lado: comisión taker 0.06 % + 0.02 % de deslizamiento (igual que el laboratorio)
+GIRO_MIN_SL = 0.006      # SL inicial mínimo: 0.6 % del precio
+GIRO_HIST = 2000
+
+
+def giro_state(st):
+    g = st.setdefault("giro", {})
+    for k, v in (("on", ""), ("pos", {}), ("hist", []), ("last", {}), ("bucket", 0)):
+        g.setdefault(k, v)
+    return g
+
+
+def giro_symbols(st):
+    return [x for x in active_symbols(st) if not tradfi_kind(x)]
+
+
+def giro_step(g, sym, d):
+    """Procesa las velas de 4h cerradas que aún no se vieron (misma lógica que el laboratorio). Devuelve los eventos nuevos."""
+    line, di = supertrend(d, ST_FACTOR, ST_ATR)
+    last = g["last"].get(sym)
+    ev = []
+    if last is None:  # primera vez: no se inventan operaciones pasadas; se empieza con el próximo giro
+        if d:
+            g["last"][sym] = d[-1]["t"]
+        return ev
+    for i in range(30, len(d)):
+        b = d[i]
+        if b["t"] <= last:
+            continue
+        lado, prev = (1 if di[i] < 0 else -1), (1 if di[i - 1] < 0 else -1)
+        pos = g["pos"].get(sym)
+        if pos:
+            s, px, why = pos["s"], None, ""
+            if (b["l"] <= pos["sl"]) if s == 1 else (b["h"] >= pos["sl"]):
+                px, why = (min(b["o"], pos["sl"]) if s == 1 else max(b["o"], pos["sl"])), "tocó la Tendencial"
+            elif lado != prev and lado == -s:
+                px, why = b["c"], "giro en contra"
+            if px is not None:
+                r = (s * (px - pos["e"]) / pos["e"] - 2 * GIRO_FEE) / pos["r0"]
+                op = dict(sym=sym, s=s, e=pos["e"], x=px, t0=pos["t"], t=b["ct"], r=round(r, 3), why=why)
+                g["hist"] = (g["hist"] + [op])[-GIRO_HIST:]
+                del g["pos"][sym]
+                ev.append(dict(op, kind="CLOSE"))
+            else:
+                if lado == s:
+                    pos["sl"] = max(pos["sl"], line[i]) if s == 1 else min(pos["sl"], line[i])
+                pos["c"] = b["c"]
+        if sym not in g["pos"] and lado != prev:
+            e = b["c"]
+            r0 = lado * (e - line[i]) / e
+            if r0 >= GIRO_MIN_SL:
+                g["pos"][sym] = dict(s=lado, e=e, sl=line[i], sl0=line[i], r0=r0, t=b["ct"], c=e)
+                ev.append(dict(kind="OPEN", sym=sym, s=lado, e=e, sl=line[i], r0=r0, t=b["ct"]))
+        g["last"][sym] = b["t"]
+    return ev
+
+
+def giro_usd(st):
+    return st.get("auto_capital", st.get("capital", 0)) * st.get("auto_risk", st.get("risk", 0)) / 100
+
+
+def giro_stats(ops):
+    rs = [o["r"] for o in ops]
+    w, l = [r for r in rs if r > 0], [r for r in rs if r <= 0]
+    pf = "∞" if not l or sum(l) == 0 else f"{sum(w) / -sum(l):.2f}"
+    return (f"{len(rs)} cerradas · ✅ {len(w)} · ❌ {len(l)} · acierto {100 * len(w) / len(rs):.0f}% · factor {pf} · "
+            f"<b>{sum(rs):+.2f} R</b>") if rs else "todavía ninguna cerrada"
+
+
+def giro_report(st):
+    g = giro_state(st)
+    usd = giro_usd(st)
+    on = g["on"] == "prueba"
+    lines = [f"🧭 <b>Giro 4h</b> [{HOST}] · " + ("🧪 <b>PRUEBA activa</b> (simulación, no envía órdenes)" if on else "apagado"),
+             "Entra cuando la Tendencial de 4h gira; el SL es la Tendencial y sale cuando el precio la toca o vuelve a girar."]
+    if on:
+        lines.append(f"Monedas: {len(giro_symbols(st))} · 1 R = ${usd:,.2f} (tu capital y riesgo de /auto)")
+    if g["pos"]:
+        lines += ["", f"<b>Abiertas ({len(g['pos'])})</b>"]
+        tot = 0.0
+        for sym, p in sorted(g["pos"].items()):
+            r = p["s"] * (p.get("c", p["e"]) - p["e"]) / p["e"] / p["r0"]
+            tot += r
+            lines.append(f"{'🟢' if p['s'] == 1 else '🔴'} {coin(sym)} {'LONG' if p['s'] == 1 else 'SHORT'} · entrada {fmt(p['e'])} · "
+                         f"SL {fmt(p['sl'])} · {r:+.2f} R · {max(0, (time.time() * 1000 - p['t']) / 86_400_000):.0f} d")
+        lines.append(f"Sin cerrar: {tot:+.2f} R")
+    lines += ["", "<b>Resultado</b>: " + giro_stats(g["hist"])]
+    if g["hist"]:
+        lines.append(f"Últimos 30 días: {giro_stats([o for o in g['hist'] if o['t'] >= time.time() * 1000 - 30 * 86_400_000])}")
+        lines.append("Últimas: " + " · ".join(f"{coin(o['sym'])} {o['r']:+.1f}R" for o in g["hist"][-6:]))
+    lines += ["", "ℹ️ En el historial (2023–2026) acertó solo el 36 % y ganó por las ganadoras grandes; tuvo rachas de −85 R y perdió "
+              "todo 2025. Hacen falta meses y al menos 50 operaciones cerradas para juzgarla.",
+              "/giro prueba · /giro no"]
+    return clip_lines(lines)
+
+
+def giro_tick(token, owner, st):
+    """Cada cierre de vela de 4h: revisa las monedas, actualiza la simulación y avisa de entradas y salidas."""
+    g = giro_state(st)
+    if g["on"] != "prueba":
+        return
+    now = time.time()
+    ms = TF_MS[GIRO_TF]
+    bucket = int(now * 1000) // ms
+    if g["bucket"] == bucket or now * 1000 % ms < 20_000:   # 20 s de margen para que la vela esté publicada
+        return
+    g["bucket"] = bucket
+    evs = []
+    for sym in giro_symbols(st) + [x for x in g["pos"] if x not in giro_symbols(st)]:
+        try:
+            evs += giro_step(g, sym, fetch_klines(sym, GIRO_TF, 300))
+        except Exception as e:
+            print(f"giro {sym}: {e}")
+    evs = [e for e in evs if e["t"] >= now * 1000 - 2 * ms]   # tras un apagón largo, lo viejo se registra sin avisar
+    if not evs:
+        return
+    usd = giro_usd(st)
+    lines = ["🧭 <b>Giro 4h · PRUEBA</b> (simulación, sin dinero)"]
+    for e in evs:
+        lado = "LONG" if e["s"] == 1 else "SHORT"
+        if e["kind"] == "OPEN":
+            lines.append(f"{'🟢' if e['s'] == 1 else '🔴'} <b>{coin(e['sym'])} {lado}</b> · entrada {fmt(e['e'])} · SL {fmt(e['sl'])} "
+                         f"({e['r0'] * 100:.1f}%)")
+        else:
+            lines.append(f"🏁 {coin(e['sym'])} {lado} cerrada ({e['why']}) · {fmt(e['e'])} → {fmt(e['x'])} · "
+                         f"<b>{e['r']:+.2f} R</b> ≈ {'+' if e['r'] >= 0 else '−'}${abs(e['r']) * usd:,.2f}")
+    lines.append(f"Total: {giro_stats(g['hist'])} · /giro")
+    try:
+        send(token, owner, clip_lines(lines))
+    except Exception as e:
+        print("giro aviso:", e)
+
+
+# ----------------------------- PRECISIÓN REAL (/real) -----------------------------
+# /stats mide las SEÑALES (simulación). /real mide el DINERO: cada posición que el bot abrió en Bitunix y ya se cerró,
+# con el PnL que informa Bitunix menos comisiones. Cada domingo se manda solo el resumen de la semana (/real semanal no).
+REAL_MIN = 30   # operaciones a partir de las que el acierto empieza a ser una medida fiable
+
+
+def _fnum(x):
+    try:
+        return float(x or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def real_ops(days=7, now=None):
+    now = now or int(time.time() * 1000)
+    since = now - days * 86_400_000 if days else 0
+    out = []
+    for o in _bx.get("journal", []):
+        if o.get("t", 0) >= since:
+            fee = abs(_fnum(o.get("fee")))
+            out.append(dict(o, net=_fnum(o.get("pnl")) - fee, fee_abs=fee))
+    return sorted(out, key=lambda o: o["t"])
+
+
+def real_report(st, days=7, now=None):
+    """Precisión con dinero real: operaciones del bot cerradas en Bitunix (neto de comisiones)."""
+    ops = real_ops(days, now)
+    head = f"📊 <b>Precisión real en Bitunix</b> [{HOST}] · {f'últimos {days} días' if days else 'todo el historial'}"
+    tail = "\n/real 30 · /real todo · /real semanal no (quita el resumen de los domingos)"
+    if not ops:
+        return (head + "\nTodavía no hay operaciones reales cerradas en este periodo.\n"
+                "Aquí solo cuentan las que el bot abrió en Bitunix (/auto si o 🎯 Entrar); las señales simuladas están en /stats." + tail)
+    net = [o["net"] for o in ops]
+    wins, loss = [v for v in net if v > 0], [v for v in net if v <= 0]
+    gp, gl = sum(wins), -sum(loss)
+    pf = lambda a, b: "∞" if b <= 0 else f"{a / b:.2f}"
+    m = lambda v: ("+" if v >= 0 else "−") + f"{abs(v):.2f}"
+    lines = [head,
+             f"Operaciones: <b>{len(ops)}</b> · ✅ {len(wins)} · ❌ {len(loss)} · acierto <b>{100 * len(wins) / len(ops):.0f}%</b>",
+             f"Resultado neto: <b>{m(sum(net))} USDT</b> (comisiones −{sum(o['fee_abs'] for o in ops):.2f} ya restadas)",
+             f"Factor: <b>{pf(gp, gl)}</b> · media {m(sum(net) / len(ops))} · mejor {m(max(net))} · peor {m(min(net))}"]
+    rr = [o["net"] / o["risk"] for o in ops if _fnum(o.get("risk")) > 0]
+    if rr:
+        lines.append(f"En riesgos: <b>{sum(rr):+.2f} R</b> · media {sum(rr) / len(rr):+.2f} R por operación ({len(rr)} con riesgo registrado)")
+
+    def group(key):
+        g = {}
+        for o in ops:
+            a = g.setdefault(key(o), [0, 0.0, 0, 0.0, 0.0])
+            a[0] += 1
+            a[1] += o["net"]
+            a[2] += 1 if o["net"] > 0 else 0
+            a[3] += max(o["net"], 0.0)
+            a[4] += max(-o["net"], 0.0)
+        return g
+    lines += ["", "⏱ <b>Por temporalidad</b> (neto · operaciones · acierto · factor real / backtest)"]
+    for tf, a in sorted(group(lambda o: o.get("tf", "?")).items(), key=lambda x: TF_MS.get(x[0], 0)):
+        bt = f" / {TF_PF[tf]:.1f}" if tf in TF_PF else ""
+        lines.append(f"{tf}: {m(a[1])} · {a[0]} · {100 * a[2] / a[0]:.0f}% · {pf(a[3], a[4])}{bt}")
+    g_sym = sorted(group(lambda o: o.get("sym", "?")).items(), key=lambda x: x[1][1], reverse=True)
+    best = " · ".join(f"{coin(s)} {m(a[1])} ({a[0]})" for s, a in g_sym[:3] if a[1] > 0)
+    worst = " · ".join(f"{coin(s)} {m(a[1])} ({a[0]})" for s, a in g_sym[::-1][:3] if a[1] < 0)
+    if best:
+        lines.append("🏅 Mejores: " + best)
+    if worst:
+        lines.append("⚠️ Peores: " + worst)
+    tp = [sum(1 for o in ops if int(o.get("tp") or 0) == k) for k in range(4)]
+    lines += ["", f"🎯 Hasta dónde llegaron: sin TP {tp[0]} · TP1 {tp[1]} · TP2 {tp[2]} · TP3 {tp[3]}"]
+    g_m = group(lambda o: bool(o.get("manual")))
+    if True in g_m and False in g_m:
+        lines.append(f"🤖 Automáticas: {g_m[False][0]} ({m(g_m[False][1])}) · 🎯 Manuales: {g_m[True][0]} ({m(g_m[True][1])})")
+    # la misma operación según la señal (simulación) y según Bitunix
+    sim = {o.get("id"): o.get("r", 0.0) for o in st.get("journal", [])}
+    both = [(sim[o["tid"]], o["net"] / o["risk"]) for o in ops if o.get("tid") in sim and _fnum(o.get("risk")) > 0]
+    if both:
+        a, b = sum(x[0] for x in both), sum(x[1] for x in both)
+        lines += ["", f"🔬 <b>Señal vs real</b> ({len(both)} operaciones): la señal marcó {a:+.2f} R · en Bitunix salió {b:+.2f} R",
+                  "La diferencia es deslizamiento, entradas que no se llenaron, comisiones reales y el tope de margen."]
+    if len(ops) < REAL_MIN:
+        lines += ["", f"⚠️ Son pocas operaciones ({len(ops)}): el acierto todavía no es fiable. Hacen falta unas {REAL_MIN}."]
+    lines.append(tail.strip("\n"))
+    return clip_lines(lines)
+
+
+def real_weekly(token, owner, st):
+    """Domingo desde las 20:00 (hora local): resumen de la semana, una sola vez."""
+    if not st.get("semanal", True) or st.get("auto") not in ("si", "prueba"):
+        return
+    g = time.gmtime(time.time() + TZ_H * 3600)
+    key = time.strftime("%Y-%m-%d", g)
+    if g.tm_wday != 6 or g.tm_hour < 20 or st.get("semanal_sent") == key:
+        return
+    st["semanal_sent"] = key
+    if real_ops(7):
+        bx_say(token, owner, "🗓 <b>Resumen de la semana</b>\n" + real_report(st, 7))
+    else:
+        bx_say(token, owner, "🗓 <b>Resumen de la semana</b>: no se cerró ninguna operación real en Bitunix.\n"
+               "Las señales simuladas de la semana están en /stats 7.")
+
+
 LLAVES_TTL = 180                                   # segundos para mandar las llaves después de /llaves
 KEY_RE = re.compile(r"[A-Za-z0-9_-]{16,128}")
 
@@ -2416,7 +2681,7 @@ def bx_open(token, owner, st, sym, tf, ev, tid, plan, manual=False):
     rec = dict(sym=sym, tf=tf, s=ev["side"], pside="LONG" if ev["side"] == 1 else "SHORT", t0=int(time.time() * 1000),
                legs=[dict(l, cid=bx_cid(tid, l["name"].lower())) for l in plan["legs"]], sl=plan["sl"], tps=plan["tps"],
                qp=plan["qp"], pp=plan["pp"], be=tf in st.get("auto_be", list(ALL_TFS)) and mg != "strike", stage=0, tpv=0,
-               tp_cids={}, synced=0.0, manual=manual, mg=mg, sl0=plan["sl"], sl_hist=[plan["sl"]],
+               tp_cids={}, synced=0.0, manual=manual, mg=mg, sl0=plan["sl"], sl_hist=[plan["sl"]], risk=round(plan_risk(plan), 4),
                berr=st.get("auto_berr", 1.0), parcial=st.get("auto_parcial", 25.0), comp=st.get("auto_comp", True))
     with _bx_lock:
         _bx["trades"][tid] = rec
@@ -2502,7 +2767,8 @@ def bx_step(token, owner, st, tid, r, positions, pend):
             p = h[0]
             with _bx_lock:
                 _bx["journal"] = (_bx["journal"] + [dict(tid=tid, sym=sym, tf=r["tf"], t=int(now * 1000), pnl=p.get("realizedPNL"),
-                                                         fee=p.get("fee"), funding=p.get("funding"), tp=r["stage"])])[-1000:]
+                                                         fee=p.get("fee"), funding=p.get("funding"), tp=r["stage"], s=r.get("s"),
+                                                         risk=r.get("risk"), manual=bool(r.get("manual")))])[-1000:]
             say(f"🏁 <b>REAL Bitunix</b> · {name} cerrada (TP alcanzados: {r['stage']}/3)\n"
                 f"PnL {float(p.get('realizedPNL') or 0):+.2f} USDT · comisiones {p.get('fee')} · funding {p.get('funding')}\n"
                 f"Entrada {p.get('entryPrice')} → salida {p.get('closePrice')}")
@@ -2745,6 +3011,7 @@ def bx_loop(token, owner, st):
             if time.time() - t_news > 30:  # v6.4: aviso de noticias de alto impacto
                 t_news = time.time()
                 news_tick(token, owner, st)
+                real_weekly(token, owner, st)
             if _bx["trades"]:
                 bx_manage(token, owner, st)
             if (st.get("auto") == "si" or st.get("aim_mode") == "si") and time.time() - t_guard > 300:
@@ -3494,6 +3761,10 @@ def main():
                     confluence(token, chat, st, ctx)
                     majors_watch(token, chat, st, ctx)
                     weekend_warn(token, chat, st)
+                    try:
+                        giro_tick(token, chat, st)   # v6.5: estrategia Giro 4h en modo prueba
+                    except Exception as e:
+                        print("giro:", e)
                     heartbeat(token, chat, st)
                     every = st.get("radar_every", 0)
                     if every and minute % every == 0:  # radar automático a Telegram
