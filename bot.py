@@ -1548,7 +1548,9 @@ def command(token, owner, st, ctx, cid, msg):
                   f"Modo de posición: {pm}" + ("" if pm == "HEDGE" else "\n⚠️ El bot opera en modo HEDGE: /bitunix hedge (sin posiciones ni órdenes abiertas)")
                   + (f"\n🌐 IP de este equipo: <code>{ip}</code> (para limitar la llave en Bitunix)" if ip else ""))
         except Exception as e:
-            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}" + ("\n🔑 Ponlas con /llaves" if "faltan las llaves" in str(e) else ""))
+            ip = mi_ip()
+            reply(f"⚠️ Bitunix [{HOST}]: {html.escape(str(e))[:300]}" + ("\n🔑 Ponlas con /llaves" if "faltan las llaves" in str(e) else "")
+                  + (f"\n🌐 IP de este equipo: <code>{ip}</code> (agrégala a tu llave en Bitunix si la limitaste por IP)" if ip else ""))
     elif cmd == "/llaves":
         if args and args[0].lower() in ("cancelar", "no"):
             st.pop("llaves_t", None)
@@ -2216,6 +2218,13 @@ def llaves_recibir(token, st, cid, msg, reply):
         err = str(e)
         for p in parts:
             err = err.replace(p, "•••")
+        if "10004" in err:  # la llave está limitada a otras IP: hay que agregar la de este equipo en Bitunix
+            ip = mi_ip()
+            reply(f"⛔ Bitunix rechazó la llave porque está <b>limitada a otra IP</b> (error 10004). No se guardó.\n\n"
+                  f"La IP de este servidor [{HOST}] es:\n<code>{ip or '¿?'}</code>\n\n"
+                  "En Bitunix → API Management → tu llave → <b>Editar</b> → <b>Vincular dirección IP</b> → agrega esa IP y guarda. "
+                  "Luego escribe /llaves otra vez y manda la misma línea." + aviso)
+            return
         reply(f"⛔ Bitunix rechazó esas llaves ({html.escape(err)[:160]}). No se guardaron. Revisa que las copiaste completas "
               "y escribe /llaves otra vez." + aviso)
         return

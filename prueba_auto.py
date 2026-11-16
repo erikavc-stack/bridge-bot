@@ -617,6 +617,11 @@ assert "no parece" in msgs[-1] and llaves_de_archivo() == (BUENA, SECRETA) and 7
 cmd("/llaves"); cmd("Q" * 32 + " " + "W" * 32, mid=79)                  # rechazadas por Bitunix: quedan las anteriores
 assert "rechazó" in msgs[-1] and llaves_de_archivo() == (BUENA, SECRETA)
 assert not any("Q" * 32 in m or "W" * 32 in m for m in msgs)
+real_rq = bot.bx_req
+bot.bx_req = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Bitunix 10004: Invalid IP"))
+cmd("/llaves"); cmd("E" * 32 + " " + "R" * 32, mid=82)                  # llave limitada a otra IP: muestra la IP del servidor
+assert "limitada a otra IP" in msgs[-1] and "203.0.113.7" in msgs[-1] and llaves_de_archivo() == (BUENA, SECRETA), msgs[-1]
+bot.bx_req = real_rq
 cmd("/llaves"); STL["llaves_t"] -= 600; cmd(f"{BUENA} {SECRETA}", mid=80)  # tarde
 assert "Pasaron más de" in msgs[-1] and 80 in borrados
 cmd("hola sin /llaves", mid=81)                                         # sin /llaves antes: se ignora
