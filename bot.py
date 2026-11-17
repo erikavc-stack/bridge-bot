@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math, hashlib, uuid
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.6"
+VERSION = "6.7"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -447,7 +447,9 @@ QA_REF = "BTCUSDT"
 # 1h pierde en el backtest con cualquier filtro probado (mejor caso factor 0.96): se avisa en el mensaje.
 WEAK_TF = {"1m": "1m pierde en el backtest: solo con riesgo mínimo", "3m": "3m pierde en el backtest (factor 0.8): solo con riesgo mínimo"}
 # v6.0: semáforo de cada temporalidad según el backtest de 30 monedas (factor de beneficio)
-TF_PF = {"3m": 0.8, "5m": 1.1, "15m": 1.5, "1h": 1.1, "2h": 1.9, "4h": 2.1, "8h": 1.6}
+# v6.7: factor MEDIDO en el laboratorio (24 monedas, comisiones incluidas): 2h/4h/8h 29 meses · 15m 21 · 1h/5m 12 · 1m/3m 4.
+# (Antes: backtest corto de oct-2026 = 3m 0.8 · 5m 1.1 · 15m 1.5 · 1h 1.1 · 2h 1.9 · 4h 2.1 · 8h 1.6, demasiado optimista.)
+TF_PF = {"1m": 0.77, "3m": 0.92, "5m": 0.82, "15m": 0.88, "1h": 0.92, "2h": 0.95, "4h": 0.84, "8h": 0.96}
 # v5.5 · VELA DE CONFIRMACIÓN en 2h y 4h: la señal espera a que la vela siguiente cierre a favor (cuerpo a favor y cierre
 # más allá del cierre anterior) y la entrada es al cierre de esa vela. Backtest 30 monedas 2h+4h+8h (8h sin cambio):
 # acierto 51 % → 54 %, factor 1.51 → 1.74, caída máxima 27 R → 12 R, peor racha 20 → 9 pérdidas; ganancia total −9 %.
@@ -750,51 +752,47 @@ def message(sym, tf, ev, extra=None, scale=1.0):
         row1 = "  ".join(mk(n, ok) for n, ok in checks[:3])
         row2 = "  ".join(mk(n, ok) for n, ok in checks[3:]) + (f"  · toque {ev['ep']}" if ev.get("ep") else "")
         pf = TF_PF.get(tf)
-        light = "" if pf is None else "🟢" if pf >= 1.3 else "🟡" if pf >= 1.0 else "🔴"
-        sep = "━━━━━━━━━━━━━━━━━━"
-        head = f"{icon} <b>{s} · {c} · {tf}</b>" + ("   ⭐ <b>A</b>" if g == "A" else f"   · {g}" if g else "")
-        lines = [head, sep, (extra.get("wr") or "🏆 Winrate: calculando historial…") + (f" · PF {pf:.2f} {light}" if pf else ""),
-                 f"🎯 <b>Confluencias {ok_n}/{len(checks)}</b>  {bar}", f"   {row1}"]
-        if row2.strip():
-            lines.append(f"   {row2.strip()}")
+        light = "" if pf is None else "🟢" if pf >= 1.15 else "🟡" if pf >= 1.0 else "🔴"
+        sh = {"Tendencial": "T", "Momentum": "M", "WaveTrend": "W", "Vela": "V"}
+        chk = lambda grp: " ".join(f"{sh.get(n, n)}{'✅' if ok else '❌'}" for n, ok in grp)
+        head = (f"{icon} <b>{s} {c} · {tf}</b> · {ev.get('q', ok_n)}/3" + (" · ⭐A" if g == "A" else f" · {g}" if g else "")
+                + (f" · {extra['hm']}" if extra.get("hm") else ""))
+        conf = f"🎯 <b>{ok_n}/{len(checks)}</b> {bar} {chk(checks[:3])}" + (f" · {chk(checks[3:])}" if checks[3:] else "") \
+            + (f" · toque {ev['ep']}" if ev.get("ep") else "")
+        wr = re.sub(r"\s*Winrate:\s*", " WR ", extra.get("wr") or "⚪ WR calculando…").replace(" R/op", "R/op")
+        lines = [head, conf, wr + (f" · medido PF {pf:.2f} {light}" if pf else "")]
         if extra.get("late"):
             lines.append(f"⏱ <i>de hace {extra['late']} min" + (f" · ahora {money(extra['now_px'])}" if extra.get("now_px") else "") + "</i>")
-        # entradas
-        er = ([] if lim else [("E1", fmt(e1), qs[0], "ahora")]) + [("E2", fmt(ev["e2"]), qs[1], pe(ev["e2"])), ("E3", fmt(ev["e3"]), qs[2], pe(ev["e3"]))]
-        # objetivos: % desde el precio medio, R desde E1, cuánto cerrar
+        # una sola tabla: entradas (cantidad · distancia) y objetivos (% desde el medio · R · cuánto cerrar)
         R = abs(e1 - ev["sl"]) or 1e-12
+        er = ([] if lim else [("E1", fmt(e1), qs[0], "ahora")]) + [("E2", fmt(ev["e2"]), qs[1], pe(ev["e2"])), ("E3", fmt(ev["e3"]), qs[2], pe(ev["e3"]))]
         tr = [(f"TP{n}", fmt(t), pa(t), f"{abs(t - e1) / R:.1f}R", f"{TP_SPLIT[n - 1] * 100:.0f}%") for n, t in enumerate(ev["tps"], 1)]
-        tr.append(("SL", fmt(ev["sl"]), pa(ev["sl"]), "−1R", f"−${risk:,.0f}"))
+        tr.append(("SL", fmt(ev["sl"]), pa(ev["sl"]), "-1R", f"-${risk:,.0f}"))
         w1 = max(len(r[1]) for r in er + tr)
-        wq = max(len(r[2]) for r in er)
-        wp = max(len(r[2]) for r in tr)
-        t_in = "\n".join(f"{r[0]:<4}{r[1]:>{w1}}  {r[2]:<{wq}}  {r[3]}".rstrip() for r in er)
-        t_out = "\n".join(f"{r[0]:<4}{r[1]:>{w1}}  {r[2]:>{wp}}  {r[3]:>4}  {r[4]}" for r in tr)
-        lines += [sep, "📥 <b>ENTRADAS</b>" + ("  · <b>solo órdenes límite</b>" if lim else "") + f"   (cant. {c})",
-                  f"<pre>{t_in}</pre>", f"⚖️ Precio medio <b>{money(avg_all)}</b>" + (f" · ahora {money(e1)}" if lim else ""),
-                  sep, "🎯 <b>OBJETIVOS</b>   (% desde el medio · cierra)", f"<pre>{t_out}</pre>"]
-        rb = abs(ev["tps"][-1] - avg_all) / max(abs(avg_all - ev["sl"]), 1e-12)
-        lines += [sep, f"⚡ <b>{ev['lev']}x</b> · margen ${margin:,.0f} · riesgo <b>−${risk:,.0f}</b> · R:B 1:{rb:.1f}"]
-        if extra.get("tradfi"):
-            lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
-        ctx_l = []
+        w2 = max(len(r[2]) for r in er + tr)
+        tab = [f"{r[0]:<3} {r[1]:>{w1}} {r[2]:>{w2}} {r[3]}".rstrip() for r in er] + \
+              [f"{r[0]:<3} {r[1]:>{w1}} {r[2]:>{w2}} {r[3]:>4} {r[4]}" for r in tr]
+        lines.append("<pre>" + "\n".join(tab) + "</pre>")
+        fee_r = 2 * FEE_TAKER / max(abs(avg_all - ev["sl"]) / avg_all, 1e-9) * 100
+        lines.append(f"⚖️ medio {money(avg_all)}" + (" · <b>solo límite</b>" if lim else "")
+                     + f" · ⚡{ev['lev']}x · margen ${margin:,.0f} · riesgo <b>-${risk:,.0f}</b>")
+        ctx_l = [f"💸 comisión {fee_r:.0f}% del riesgo" + (" ⚠" if fee_r >= 25 else "")]
         if extra.get("dirs"):
             fav = sum(1 for _, up_ in extra["dirs"] if up_ == (ev["side"] == 1))
             ctx_l.append(f"📈 {fav}/{len(extra['dirs'])} TF a favor")
         if extra.get("conf"):
-            ctx_l.append(f"🔥 también {s} en {' '.join(extra['conf'])}")
+            ctx_l.append(f"🔥 {' '.join(extra['conf'])}")
         if "open_n" in extra:
             ctx_l.append(f"🧯 {extra.get('open_n', 0) + 1}" + (f"/{extra['max_ops']}" if extra.get("max_ops") else "") + " abiertas")
-        if ctx_l:
-            lines.append(" · ".join(ctx_l))
+        lines.append(" · ".join(ctx_l))
+        if extra.get("tradfi"):
+            lines.append(f"🏛 máx. {TRADFI_MAX_LEV}x" + (" · bolsa cerrada" if extra.get("night") else ""))
         if extra.get("same"):
             lines.append(f"⚠️ Ya tienes {c} en {', '.join(extra['same'])}")
         if tf in WEAK_TF:
             lines.append(f"⚠️ <i>{WEAK_TF[tf]}</i>")
         tips = (["sin llenar al llegar a TP1 → cancela"] if lim else []) + (["en TP1 → SL a la entrada"] if tf in BE_TFS else [])
-        if tips:
-            lines.append("💡 <i>" + " · ".join(tips) + "</i>")
-        lines.append(f"🔗 {link}" + (f" · {extra['hm']}" if extra.get("hm") else ""))
+        lines.append(f"🔗 {link}" + (" · 💡 <i>" + " · ".join(tips) + "</i>" if tips else ""))
         return "\n".join(lines)
     hdr = f"{icon} <b>{s} · {coin(sym)} · {tf}</b> · {link}"
     prog = lambda n: "▰" * n + "▱" * (3 - n)
@@ -1779,7 +1777,7 @@ def dirs_line(sym, ctx, tfs=CONF_TFS):
 
 
 def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
-    """v5.3: compacta, con winrate de cada temporalidad y calidad: dirección clara, plan de la señal más reciente y una línea con cada temporalidad."""
+    """v6.7: tarjeta compacta: una fila por temporalidad (puntos, calidad, estado y winrate) y el plan de la señal más reciente."""
     s, icon = ("LONG", "🟢") if side == 1 else ("SHORT", "🔴")
     c_ = coin(sym)
     fav = ups if side == 1 else n - ups
@@ -1787,39 +1785,33 @@ def conf_message(st, ctx, sym, side, tfs, newest, ups, n, scale=1.0):
     T = c["T"]
     age = max(0, int((time.time() * 1000 - c["t_open"]) // 60_000))
     lev = min(T["lev"], TRADFI_MAX_LEV) if tradfi_kind(sym) else T["lev"]
-    link = f"<a href=\"{chart_url(sym, newest)}\">{sym}.P</a>"
+    link = f"<a href=\"{chart_url(sym, newest)}\">{sym}.P {newest.upper()}</a>"
     qty = T.get("qty") or [0, 0, 0]
     avg_c = sum(q * e for q, e in zip(qty, (T["e1"], T["e2"], T["e3"]))) / sum(qty) if sum(qty) > 0 else T["e1"]
     pa = lambda x: f"{side * (x - avg_c) / avg_c * 100:+.1f}%"
     risk = st.get("capital", 0) * st.get("risk", 0) / 100 * scale
-    bar = "━━━━━━━━━━━━"
-    wrs = []
-    for t in tfs:
-        h, tt = hist_stats(st, f"{sym}_{t}"), tf_stats(st, t)
-        x = h if h["n"] >= 5 else tt
-        wrs.append(f"{t} {x['wr']:.0f}%" if x["n"] >= 5 else f"{t} —")
-    g = T.get("g")
-    lines = [f"🔥{icon} <b>CONFLUENCIA {s} · {c_}</b>",
-             f"{link} · <b>{len(tfs)} TF en {s}</b> · Tendencial {fav}/{n} a favor",
-             "🏆 <b>Winrate</b> " + " · ".join(wrs),
-             bar, f"🆕 Señal {newest} · {T['q']}/3" + (" · ⭐ <b>Calidad A</b>" if g == "A" else f" · Calidad {g}" if g else "") + f" · hace {age} min"]
-    # v5.2: entradas y TP en vertical, con ✓ cuando ya se tocaron
-    fl = T.get("fills", 1)
-    if qty[0] > 0:
-        lines.append(f"💰 E1 {money(T['e1'])} · {fq(qty[0] * scale)}" + (" ✓" if T["pos"] > 0 else ""))
-    lines.append(f"📥 E2 {money(T['e2'])} · {fq(qty[1] * scale)}" + (" ✓" if fl >= 2 else ""))
-    lines.append(f"📥 E3 {money(T['e3'])} · {fq(qty[2] * scale)}" + (" ✓" if fl >= 3 else ""))
-    lines.append(f"🛑 SL {money(T['sl'])} ({pa(T['sl'])})" + (f" · −${risk:,.0f}" if risk else "") + f" · ⚡{lev}x")
-    lines += [f"🎯 TP{k} {money(t)} ({pa(t)})" + (" ✓" if T.get("tp", 0) >= k else "") for k, t in enumerate(T["tps"], 1)]
-    lines.append(bar)
-    det = []
+    rows = []
     for t in tfs:
         Tt = ctx[(sym, t)]["T"]
-        h = hist_stats(st, f"{sym}_{t}")
+        h, tt = hist_stats(st, f"{sym}_{t}"), tf_stats(st, t)
+        x = h if h["n"] >= 5 else tt
         est = "límite" if Tt["pos"] == 0 else f"TP{Tt['tp']}✓" if Tt.get("tp") else "en curso"
-        det.append(f"{t} {Tt['q']}/3 {est}" + (" A" if Tt.get("g") == "A" else ""))
-    lines.append("📋 " + " · ".join(det))
-    lines.append("📊 <i>3+ TF a la vez: el backtest gana más. Usa SL.</i>" if len(tfs) >= CONF_MIN else f"₿ <i>{c_}: solo 2 TF, tómalo como contexto.</i>")
+        rows.append((t + ("*" if t == newest else ""), f"{Tt['q']}/3" + (" A" if Tt.get("g") == "A" else ""), est,
+                     f"WR {x['wr']:.0f}%" if x["n"] >= 5 else "WR —"))
+    w = [max(len(r[i]) for r in rows) for i in range(4)]
+    tab = [f"{r[0]:<{w[0]}} {r[1]:<{w[1]}} {r[2]:<{w[2]}} {r[3]}" for r in rows]
+    fl = T.get("fills", 1)
+    ent = ([f"E1 {fmt(T['e1'])}" + (" ✓" if T["pos"] > 0 else "")] if qty[0] > 0 else []) + \
+          [f"E2 {fmt(T['e2'])}" + (" ✓" if fl >= 2 else ""), f"E3 {fmt(T['e3'])}" + (" ✓" if fl >= 3 else "")]
+    tps = " / ".join(fmt(t) + (" ✓" if T.get("tp", 0) >= k else "") for k, t in enumerate(T["tps"], 1))
+    g = T.get("g")
+    lines = [f"🔥{icon} <b>CONFLUENCIA {s} {c_}</b> · <b>{len(tfs)} TF</b> · Tendencial {fav}/{n}",
+             "<pre>" + "\n".join(tab) + "</pre>",
+             f"🆕 {newest} · {T['q']}/3" + (" · ⭐A" if g == "A" else f" · {g}" if g else "") + f" · hace {age} min · ⚡{lev}x",
+             "📥 " + " · ".join(ent),
+             f"🛑 SL {fmt(T['sl'])} ({pa(T['sl'])})" + (f" · -${risk:,.0f}" if risk else ""),
+             f"🎯 TP {tps}",
+             f"🔗 {link}" + ("" if len(tfs) >= CONF_MIN else f" · <i>solo {len(tfs)} TF: tómalo como contexto</i>")]
     return "\n".join(lines)
 
 
@@ -2504,9 +2496,9 @@ def real_report(st, days=7, now=None):
             a[3] += max(o["net"], 0.0)
             a[4] += max(-o["net"], 0.0)
         return g
-    lines += ["", "⏱ <b>Por temporalidad</b> (neto · operaciones · acierto · factor real / backtest)"]
+    lines += ["", "⏱ <b>Por temporalidad</b> (neto · operaciones · acierto · factor real / medido en el laboratorio)"]
     for tf, a in sorted(group(lambda o: o.get("tf", "?")).items(), key=lambda x: TF_MS.get(x[0], 0)):
-        bt = f" / {TF_PF[tf]:.1f}" if tf in TF_PF else ""
+        bt = f" / {TF_PF[tf]:.2f}" if tf in TF_PF else ""
         lines.append(f"{tf}: {m(a[1])} · {a[0]} · {100 * a[2] / a[0]:.0f}% · {pf(a[3], a[4])}{bt}")
     g_sym = sorted(group(lambda o: o.get("sym", "?")).items(), key=lambda x: x[1][1], reverse=True)
     best = " · ".join(f"{coin(s)} {m(a[1])} ({a[0]})" for s, a in g_sym[:3] if a[1] > 0)

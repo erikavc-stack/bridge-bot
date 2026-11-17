@@ -673,7 +673,7 @@ bot._bx["journal"] = [
 rp = bot.real_report(STR, 7)
 assert "Operaciones: <b>2</b> · ✅ 1 · ❌ 1 · acierto <b>50%</b>" in rp, rp
 assert "<b>+1.00 USDT</b>" in rp and "comisiones −0.20" in rp and "Factor: <b>2.00</b>" in rp, rp
-assert "<b>+0.00 R</b>" in rp and "15m: +2.00 · 1 · 100% · ∞ / 1.5" in rp and "2h: −1.00 · 1 · 0%" in rp, rp
+assert "<b>+0.00 R</b>" in rp and "15m: +2.00 · 1 · 100% · ∞ / 0.88" in rp and "2h: −1.00 · 1 · 0%" in rp, rp
 assert "la señal marcó +0.20 R · en Bitunix salió +0.00 R" in rp and "Automáticas: 1" in rp and "pocas operaciones (2)" in rp, rp
 assert "Operaciones: <b>3</b>" in bot.real_report(STR, 0)
 real_gm = bot.time.gmtime
