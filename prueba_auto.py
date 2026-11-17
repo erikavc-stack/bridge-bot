@@ -742,6 +742,40 @@ cmd_g("/giro no")
 assert bot.giro_state(STG)["on"] == "" and "apagado" in msgs[-1]
 bot.fetch_klines = real_fk
 
+# 30. /solo (v6.6): deja exactamente esas monedas, quita las demás, pone /top 0 y avisa de las que no existen
+real_fk2 = bot.fetch_klines
+real_as = bot.active_symbols
+bot.fetch_klines = lambda sym, tf, limit=600: (_ for _ in ()).throw(RuntimeError("no existe")) if sym == "NOEXISTEUSDT" else []
+bot.active_symbols = lambda st: list(st["symbols"])
+STS = {"users": {"owner": {}}, "pending": {}, "capital": 100, "risk": 1, "symbols": ["BTCUSDT", "XRPUSDT", "DOGEUSDT"],
+       "removed": ["TRXUSDT"], "top": 30}
+cmd_s = lambda text: bot.command("t", "1", STS, {}, "1", {"text": text, "message_id": 1})
+cmd_s("/solo")
+assert "Uso: /solo" in msgs[-1] and STS["symbols"] == ["BTCUSDT", "XRPUSDT", "DOGEUSDT"] and STS["top"] == 30, msgs[-1]
+cmd_s("/solo btc, eth 1000PEPE noexiste btc")
+assert STS["symbols"] == ["BTCUSDT", "ETHUSDT", "1000PEPEUSDT"] and STS["top"] == 0, STS["symbols"]
+assert set(STS["removed"]) == {"TRXUSDT", "XRPUSDT", "DOGEUSDT"}, STS["removed"]
+assert "3 monedas" in msgs[-1] and "NOEXISTEUSDT" in msgs[-1], msgs[-1]
+bot.fetch_klines, bot.active_symbols = real_fk2, real_as
+
+# 31. /auto monedas (v6.6): el automático solo opera las monedas elegidas; las demás no abren nada; "todas" lo quita
+fx = nuevo()
+bot.fetch_klines = lambda sym, tf, limit=600: []
+STM = dict(ST, auto="si", trades={}, users={"owner": {}}, pending={})
+cmd_m = lambda text: bot.command("t", "1", STM, {}, "1", {"text": text, "message_id": 1})
+cmd_m("/auto monedas btc eth")
+assert STM["auto_syms"] == ["BTCUSDT", "ETHUSDT"] and "solo 2" in msgs[-1], msgs[-1]
+n = len(msgs)
+bot.auto_signal("t", "1", STM, "SOLUSDT", "15m", EV, TID)
+assert len(msgs) == n and not fx.orders and not bot._bx["trades"]      # SOL no está en la lista: ni opera ni escribe
+assert bot.giro_symbols(STM) == ["BTCUSDT", "ETHUSDT"]
+cmd_m("/auto monedas sol")
+bot.auto_signal("t", "1", STM, "SOLUSDT", "15m", EV, TID)
+assert "REAL · órdenes enviadas" in msgs[-1], msgs[-1]
+cmd_m("/auto monedas todas")
+assert STM["auto_syms"] == [] and "todas las que vigila" in msgs[-1], msgs[-1]
+bot.fetch_klines = real_fk2
+
 print("OK: firma, plan, errores aislados, prioridad de equipos, operación real simulada (LONG/SHORT, TP, BE, fallos, cierre, "
       "límites, apply) y v6.4 (🎯 apuntar, soltar/devolver, gestión STRIKE con BE compensado, /posiciones, seguro de riesgo)")
 

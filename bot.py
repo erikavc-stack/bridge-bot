@@ -19,7 +19,7 @@ Modos:
 import json, os, re, sys, time, threading, socket, signal, html, math, hashlib, uuid
 import urllib.request, urllib.parse, urllib.error
 
-VERSION = "6.5"
+VERSION = "6.6"
 
 try:
     sys.stdout.reconfigure(errors="replace")
@@ -1179,6 +1179,7 @@ HELP_OWNER = (HELP_USER + "\n\n👑 <b>Administrador</b>\n"
               "/seguro 5 · /seguro no → aviso si tu riesgo abierto pasa ese % de la cuenta\n"
               "/bitunix → revisa tus llaves de Bitunix · /bitunix hedge → modo de posición HEDGE\n"
               "/llaves → poner tus llaves de Bitunix en este equipo (tu mensaje se borra al instante)\n"
+              "/solo BTC ETH SOL … → vigilar SOLO esas monedas (quita las demás) · /agregar X · /quitar X · /lista\n"
               "/giro prueba · /giro no → estrategia nueva Giro 4h en modo PRUEBA (simulación, sin dinero) · /giro = resultado\n"
               "/real → precisión con dinero REAL en Bitunix: acierto, neto, por temporalidad y moneda (resumen cada domingo)\n"
               "/noticias 15 · /noticias no → pausa del automático alrededor de noticias de alto impacto (CPI, Fed, empleo…)\n"
@@ -1423,6 +1424,28 @@ def command(token, owner, st, ctx, cid, msg):
                 st["symbols"].append(s)
                 added.append(s)
         reply("⭐ Agregado: " + (", ".join(added) if added else "nada nuevo") + "\nFavoritos: " + ", ".join(st["symbols"]))
+    elif cmd == "/solo":   # v6.6: deja EXACTAMENTE estas monedas (quita las demás y apaga el escaneo de las de más volumen)
+        ok, bad = [], []
+        for a in re.split(r"[,\s]+", " ".join(args)):
+            if not a.strip():
+                continue
+            x = norm_symbol(a)
+            try:
+                fetch_klines(x, "1m", 5)
+                if x not in ok:
+                    ok.append(x)
+            except Exception:
+                bad.append(x)
+        if not ok:
+            reply("Uso: /solo BTC ETH SOL …  → el bot vigila SOLO esas monedas (quita las demás y pone /top 0)."
+                  + ("\n⚠️ No existen en Binance ni en Bitunix: " + ", ".join(bad) if bad else "")
+                  + "\nAhora: " + ", ".join(coin(x) for x in active_symbols(st)))
+            return
+        st["removed"] = [x for x in dict.fromkeys(st["removed"] + st["symbols"]) if x not in ok]
+        st["symbols"], st["top"] = ok, 0
+        reply(f"⭐ Lista fijada: <b>{len(ok)} monedas</b> (las demás se quitaron y el escaneo por volumen quedó en 0)\n"
+              + ", ".join(coin(x) for x in ok) + ("\n⚠️ No existen en Binance ni en Bitunix: " + ", ".join(bad) if bad else "")
+              + "\nLas operaciones ya abiertas de otras monedas se siguen hasta su cierre.\n/agregar X · /quitar X · /lista")
     elif cmd in ("/quitar", "/remove"):
         for a in args:
             s = norm_symbol(a)
@@ -1494,6 +1517,25 @@ def command(token, owner, st, ctx, cid, msg):
             st["auto_lev"] = int(v)
         elif a == "tf" and words:
             st["auto_tfs"] = [t for t in ALL_TFS if t in words] or list(AUTO_TFS)
+        elif a == "monedas" and words:
+            if words[0] in ("todas", "todo", "all"):
+                st["auto_syms"] = []
+            else:
+                ok, bad = [], []
+                for w in re.split(r"[,\s]+", " ".join(args[1:])):
+                    if not w.strip():
+                        continue
+                    x = norm_symbol(w)
+                    try:
+                        fetch_klines(x, "1m", 5)
+                        if x not in ok:
+                            ok.append(x)
+                    except Exception:
+                        bad.append(x)
+                if bad:
+                    reply("⚠️ No existen en Binance ni en Bitunix (no se agregaron): " + ", ".join(bad))
+                if ok:
+                    st["auto_syms"] = ok
         elif a == "be" and words:
             st["auto_be"] = list(ALL_TFS) if words[0] in ("si", "sí", "on") else [t for t in ALL_TFS if t in words]
         elif a in ("gestion", "gestión") and words and words[0] in ("bot", "strike"):
@@ -2287,7 +2329,7 @@ def giro_state(st):
 
 
 def giro_symbols(st):
-    return [x for x in active_symbols(st) if not tradfi_kind(x)]
+    return [x for x in (st.get("auto_syms") or active_symbols(st)) if not tradfi_kind(x)]   # v6.6: la lista de /auto monedas
 
 
 def giro_step(g, sym, d):
@@ -2640,6 +2682,8 @@ def auto_signal(token, owner, st, sym, tf, ev, tid, late=False):
     live = st.get("auto") == "si"
     if tf not in st.get("auto_tfs", AUTO_TFS):
         return  # filtro: solo las temporalidades elegidas con /auto tf
+    if st.get("auto_syms") and sym not in st["auto_syms"]:
+        return  # v6.6: solo las monedas elegidas con /auto monedas (las demás siguen avisando, pero no se operan)
     try:
         why = ""
         if live:
@@ -3048,6 +3092,7 @@ def auto_status(st):
     return (f"🤖 <b>Auto Bitunix</b> [{HOST}]: {mode}\n"
             f"💰 Capital: ${cap:g} · riesgo {risk:g} % = ${cap * risk / 100:g} por operación\n"
             f"⏱ Temporalidades: {', '.join(st.get('auto_tfs', AUTO_TFS))}\n"
+            f"🪙 Monedas: " + (f"solo {len(st['auto_syms'])}: {', '.join(coin(x) for x in st['auto_syms'])}" if st.get("auto_syms") else "todas las que vigila el bot") + "\n"
             f"🔢 Máx. operaciones: {st.get('auto_ops', 1)} · margen máx: ${st.get('auto_max', AUTO_CAP):g} · "
             f"apalancamiento máx: {st.get('auto_lev', 0) or 'el de la señal'}\n"
             f"🛑 Pérdida máxima diaria: {st.get('auto_loss', 5):g} % · 🛟 BE tras TP1: {', '.join(be) if be else 'no'}\n"
@@ -3058,6 +3103,7 @@ def auto_status(st):
             + ("📂 Abiertas:\n" + "\n".join(rows) + "\n" if rows else "") +
             "\n/auto prueba · /auto si · /auto no\n/auto capital 500 · /auto riesgo 1 · /auto ops 1 · /auto max 10\n"
             "/auto perdida 5 · /auto lev 20 · /auto tf 2h 4h 8h · /auto be si|no|15m 4h\n"
+            "/auto monedas BTC ETH SOL … · /auto monedas todas\n"
             "/auto gestion bot|strike · /auto berr 1 · /auto parcial 25 · /auto compensado si|no")
 
 

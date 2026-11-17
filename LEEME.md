@@ -165,6 +165,8 @@ noviembre 2026: factor 1.32, acierto 36 %, +285 R, peor racha −85 R; **perdió
 `/giro` muestra abiertas y resultado en R · `/giro no` la apaga. `/giro si` se niega: el dinero real se decide después de la
 prueba.
 
+**🪙 Monedas (v6.6)**: `/solo BTC ETH SOL …` deja el bot vigilando SOLO esas monedas (quita las demás y pone `/top 0`). `/auto monedas BTC ETH SOL …` limita el automático (y la prueba de Giro 4h) a esa lista sin dejar de avisar las demás; `/auto monedas todas` lo quita. Elegir monedas por su winrate pasado no mejoró el Bridge Táctico en el laboratorio (`treding/elegir_monedas.py`); en Giro 4h ayudó un poco.
+
 **📊 Precisión real** (`/real`): `/stats` mide las señales (simulación); `/real` mide el **dinero**: cada posición que el bot
 abrió en Bitunix y ya se cerró, con el PnL que informa Bitunix menos comisiones. Muestra acierto, neto en USDT, factor, resultado
 en R, desglose por temporalidad (factor real junto al del backtest) y por moneda, hasta qué TP llegaron, automáticas vs manuales
